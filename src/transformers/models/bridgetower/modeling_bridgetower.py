@@ -638,6 +638,7 @@ class BridgeTowerBertCrossLayer(nn.Module):
         output_attentions=False,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        torch.cuda.nvtx.range_push('self attention')
         self_attention_outputs = self.attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -645,12 +646,13 @@ class BridgeTowerBertCrossLayer(nn.Module):
             output_attentions=output_attentions,
             past_key_value=None,
         )
+        torch.cuda.nvtx.range_pop()
         attention_output = self_attention_outputs[0]
 
         # if decoder, the last output is tuple of self-attn cache
         # add self attentions if we output attention weights
         outputs = self_attention_outputs[1:]
-
+        torch.cuda.nvtx.range_push('cross attention')
         cross_attention_outputs = self.crossattention(
             attention_output,
             attention_mask=attention_mask,
@@ -660,13 +662,15 @@ class BridgeTowerBertCrossLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
         )
+        torch.cuda.nvtx.range_pop()
         attention_output = cross_attention_outputs[0]
         # add cross attentions if we output attention weights
         outputs = outputs + cross_attention_outputs[1:-1]
-
+        torch.cuda.nvtx.range_push('apply chunking to fwd')
         layer_output = apply_chunking_to_forward(
             self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
         )
+        torch.cuda.nvtx.range_pop()
         outputs = (layer_output,) + outputs
 
         return outputs
@@ -1344,14 +1348,18 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
 
         # Run the first 'split_index' layers of the textual encoder
-        for layer in self.text_model.encoder.layer[:split_index]:
+        for i, layer in enumerate(self.text_model.encoder.layer[:split_index]):
+            torch.cuda.nvtx.range_push(f'part-1 text encoder layer {i}')
             text_embeds = layer(text_embeds, extend_text_masks)[0]
 
             if output_hidden_states:
                 all_hidden_states_text += (text_embeds,)
+            torch.cuda.nvtx.range_pop()
 
         if image_embeds is None:
+            torch.cuda.nvtx.range_push(f'part-1 visual forward_pre')
             image_embeds = self.vision_model.visual.forward_pre(pixel_values.type(self.vision_model.dtype))
+            torch.cuda.nvtx.range_pop()
         else:
             # Permute as BridgeTowerResidualAttention has batch_first=True
             image_embeds = image_embeds.permute(1, 0, 2)
@@ -1360,12 +1368,16 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             all_hidden_states_image += (image_embeds,)
 
         # Run the first 'split_index' layers of the visual encoder
-        for block in self.vision_model.visual.transformer.resblocks[:split_index]:
+        for i, block in enumerate(self.vision_model.visual.transformer.resblocks[:split_index]):
+            torch.cuda.nvtx.range_push(f'part-1 image encoder layer {i}')
             image_embeds = block(image_embeds)
             if output_hidden_states:
                 all_hidden_states_image += (image_embeds,)
+            torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push(f'visual forward_post')
         image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))
+        torch.cuda.nvtx.range_pop()
 
         # first layer is a special case because we don't have the output from the cross-encoder yet
         cross_modal_text = self.cross_modal_text_transform(text_embeds)
@@ -1422,10 +1434,15 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         #  Each of the top 6 layers of the visual and textual encoders ([split_index:]) is connected to each layer of
         #  the cross-modal encoder via bridge layers, which brings bottom-up alignment and fusion to the cross-modal encoder.
         for i in range(split_index, len(self.text_model.encoder.layer)):
+            torch.cuda.nvtx.range_push(f'cross-model encoder layer {i}')
+            torch.cuda.nvtx.range_push(f'part-2 text encoder layer {i}')
             text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks)[0]
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(f'part-2 image encoder layer {i}')
             image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds).type(
                 self.vision_model.dtype
             )
+            torch.cuda.nvtx.range_pop()
             image_embeds_with_ln = (
                 self.cross_modal_image_transform(self.vision_model.visual.forward_post(image_embeds))
                 + image_token_type_embeddings
@@ -1435,14 +1452,19 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             image_link_tower = self.cross_modal_image_link_tower[link_layer_index]
 
             # Bridge layers for textual and visual encoders
-            cross_text_features_ = text_link_tower(
+            torch.cuda.nvtx.range_push(f'text link tower layer {i}')
+            cross_text_features_ = text_link_tower( #vasu
                 self.cross_modal_text_transform(text_embeds) + text_token_type_embeddings,
                 cross_text_features,
                 extend_text_masks,
             )
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(f'image link tower layer {i}')
             cross_image_features_ = image_link_tower(image_embeds_with_ln, cross_image_features, extend_image_masks)
+            torch.cuda.nvtx.range_pop()
 
             # Cross-modal encoder via bridge layers of textual and visual encoders
+            torch.cuda.nvtx.range_push(f'cross-model text layer {i}')
             layer_outputs_text = self.cross_modal_text_layers[link_layer_index + 1](
                 cross_text_features_,
                 cross_image_features_,
@@ -1450,8 +1472,9 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 encoder_attention_mask=extend_image_masks,
                 output_attentions=output_attentions,
             )
+            torch.cuda.nvtx.range_pop()
             cross_text_features = layer_outputs_text[0]
-
+            torch.cuda.nvtx.range_push(f'cross-model image layer {i}')
             layer_outputs_image = self.cross_modal_image_layers[link_layer_index + 1](
                 cross_image_features_,
                 cross_text_features_,
@@ -1459,6 +1482,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 encoder_attention_mask=extend_text_masks,
                 output_attentions=output_attentions,
             )
+            torch.cuda.nvtx.range_pop()
             cross_image_features = layer_outputs_image[0]
 
             link_layer_index += 1
@@ -1470,6 +1494,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
 
             if output_attentions:
                 all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
+            torch.cuda.nvtx.range_pop()
 
         #  Concatenate the cls token of the text and image features to get the final represtation
         text_features, image_features = cross_text_features, cross_image_features
@@ -1782,6 +1807,7 @@ class BridgeTowerForContrastiveLearning(BridgeTowerPreTrainedModel):
         self.logit_scale = nn.Parameter(torch.tensor(self.config.logit_scale_init_value))
         # Initialize weights and apply final processing
         self.post_init()
+        self.print = False
 
     @add_start_docstrings_to_model_forward(BRIDGETOWER_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BridgeTowerContrastiveOutput, config_class=_CONFIG_FOR_DOC)
@@ -1859,18 +1885,30 @@ class BridgeTowerForContrastiveLearning(BridgeTowerPreTrainedModel):
         text_embeds = hidden_states_txt[-1]
         image_embeds = hidden_states_img[-1]
 
+        if self.print:
+            print (f'vision_model.visual.forward_post image_embeds:{image_embeds.shape}-{image_embeds.dtype}')
         image_embeds_with_ln = self.bridgetower.vision_model.visual.forward_post(image_embeds)
         image_token_type_embeddings = self.bridgetower.token_type_embeddings(
             torch.full((1,), 1, dtype=torch.long, device=self.bridgetower.token_type_embeddings.weight.device)
         ).expand_as(image_embeds_with_ln)
 
+        
+        if self.print:
+            print (f'cross_modal_image_transform image_embeds_with_ln:{image_embeds_with_ln.shape}-{image_embeds_with_ln.dtype}, image_token_type_embeddings:{image_token_type_embeddings.shape}-{image_token_type_embeddings.dtype}')
         image_embeds = self.bridgetower.cross_modal_image_transform(image_embeds_with_ln) + image_token_type_embeddings
 
         # normalized features
+
+        if self.print:
+            print (f'BridgeTowerContrastiveHead itc_text_head text_embeds:{text_embeds.shape}-{text_embeds.dtype}')
         text_embeds = nn.functional.normalize(self.itc_text_head(text_embeds[:, 0, :]), dim=-1, p=2)
+        if self.print:
+            print (f'BridgeTowerContrastiveHead itc_image_head image_embeds:{image_embeds.shape}-{image_embeds.dtype}')
         image_embeds = nn.functional.normalize(self.itc_image_head(image_embeds[:, 0, :]), dim=-1, p=2).to(
             device=text_embeds.device
         )
+        if self.print:
+            print (f'BridgeTowerContrastiveHead itc_cross_modal_head pooler_output:{pooler_output.shape}-{pooler_output.dtype}')
         cross_embeds = nn.functional.normalize(self.itc_cross_modal_head(pooler_output), dim=-1, p=2).to(
             device=text_embeds.device
         )
@@ -1878,6 +1916,8 @@ class BridgeTowerForContrastiveLearning(BridgeTowerPreTrainedModel):
         logits = torch.stack([text_embeds, image_embeds, cross_embeds], dim=-2)
 
         logit_scale = self.logit_scale.exp().to(device=text_embeds.device)
+        if self.print:
+            print (f'Before matmul text_embeds:{text_embeds.shape}-{text_embeds.dtype} image_embeds:{image_embeds.shape}-{image_embeds.dtype} cross_embeds:{cross_embeds.shape}-{cross_embeds.dtype}')
         logits_text_to_image = torch.matmul(text_embeds, image_embeds.t()) * logit_scale
         logits_text_to_cross = torch.matmul(text_embeds, cross_embeds.t()) * logit_scale
         logits_image_to_cross = torch.matmul(image_embeds, cross_embeds.t()) * logit_scale
@@ -1886,15 +1926,19 @@ class BridgeTowerForContrastiveLearning(BridgeTowerPreTrainedModel):
 
         if return_loss:
             labels = torch.arange(len(logits), device=logits.device)
+            if self.print:
+                print (f'Before cross_entropy logits_text_to_image:{logits_text_to_image.shape}-{logits_text_to_image.dtype} logits_text_to_cross:{logits_text_to_cross.shape}-{logits_text_to_cross.dtype} logits_image_to_cross:{logits_image_to_cross.shape}-{logits_image_to_cross.dtype}')
             text_to_image_loss = nn.functional.cross_entropy(logits_text_to_image, labels)
             text_to_cross_loss = nn.functional.cross_entropy(logits_text_to_cross, labels)
             image_to_cross_loss = nn.functional.cross_entropy(logits_image_to_cross, labels)
+            if self.print:
+                print (f'Before average_loss text_to_image_loss:{text_to_image_loss.shape}-{text_to_image_loss.dtype} text_to_cross_loss:{text_to_cross_loss.shape}-{text_to_cross_loss.dtype} image_to_cross_loss:{image_to_cross_loss.shape}-{image_to_cross_loss.dtype}')
             itc_loss = (text_to_image_loss + text_to_cross_loss + image_to_cross_loss) / 3.0
 
         if not return_dict:
             output = (logits, text_embeds, image_embeds, cross_embeds) + outputs[3:]
             return ((itc_loss,) + output) if itc_loss is not None else output
-
+        self.print = False
         return BridgeTowerContrastiveOutput(
             loss=itc_loss,
             logits=logits,

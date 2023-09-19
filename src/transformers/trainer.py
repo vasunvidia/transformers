@@ -182,7 +182,7 @@ if is_fairscale_available():
 
 
 if is_sagemaker_mp_enabled():
-    import smdistributed.modelparallel.torch as smp
+    import smdistributed.modelparallel.torch as amp
     from smdistributed.modelparallel import __version__ as SMP_VERSION
 
     IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
@@ -1823,8 +1823,14 @@ class Trainer:
                     sampler = sampler if sampler is not None else []
                     _ = list(sampler)
 
+        # get a batch of data
+        for step, inputs in enumerate(train_dataloader):
+            saved_inputs = inputs
+            print (f'VASU pixel_values:{inputs["pixel_values"].shape}-{inputs["pixel_values"].dtype}, input_ids:{inputs["input_ids"].shape}-{inputs["input_ids"].shape}-{inputs["input_ids"].dtype} attention_mask:{inputs["attention_mask"].shape}-{inputs["attention_mask"].dtype}')
+            break 
+
         total_batched_samples = 0
-        for epoch in range(epochs_trained, num_train_epochs):
+        for epoch in range(epochs_trained, num_train_epochs):#vasu
             epoch_iterator = train_dataloader
 
             # Reset the past mems state at the beginning of each epoch if necessary.
@@ -1850,7 +1856,23 @@ class Trainer:
                 rng_to_sync = True
 
             step = -1
-            for step, inputs in enumerate(epoch_iterator):
+            skip_loader = os.getenv("SKIP_LOADER") == '1'
+            # only use one batch of data when skip loader
+            if skip_loader:
+                epoch_iterator_override = [saved_inputs for i in range(len(epoch_iterator))]
+                logger.info("\n\n Skipping the data loader!!!!!! \n\n")
+            else:
+                epoch_iterator_override = epoch_iterator
+
+            for step, inputs in enumerate(epoch_iterator_override):
+                if epoch==0:
+                    if step == 10:
+                        print ('Start profiling')
+                        torch.cuda.profiler.start()
+                    if step == 20:
+                        print ('Stop profiling')
+                        torch.cuda.profiler.stop()
+
                 total_batched_samples += 1
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)
@@ -1872,6 +1894,8 @@ class Trainer:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
+                    #if epoch==0 and step<10:
+                    #    logger.info(f"VASU {[i.shape for i in inputs]}")
                     tr_loss_step = self.training_step(model, inputs)
 
                 if (
@@ -1904,6 +1928,7 @@ class Trainer:
                         self.accelerator.gradient_state._set_sync_gradients(True)
 
                     # Gradient clipping
+                    torch.cuda.nvtx.range_push("gradient clipping")
                     if args.max_grad_norm is not None and args.max_grad_norm > 0:
                         # deepspeed does its own clipping
 
@@ -1934,8 +1959,10 @@ class Trainer:
                                 model.parameters(),
                                 args.max_grad_norm,
                             )
+                    torch.cuda.nvtx.range_pop()
 
                     # Optimizer step
+                    torch.cuda.nvtx.range_push("optimizer")
                     optimizer_was_run = True
                     if is_torch_tpu_available():
                         if self.do_grad_scaling:
@@ -1958,6 +1985,7 @@ class Trainer:
                         # Delay optimizer scheduling until metrics are generated
                         if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                             self.lr_scheduler.step()
+                    torch.cuda.nvtx.range_pop()
 
                     model.zero_grad()
                     self.state.global_step += 1
