@@ -205,7 +205,7 @@ class BridgeTowerResidualAttention(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attn_mask = None
-        self.print = 0
+        self.print = 1000
 
     def attention(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor):
         if attention_mask is not None:
@@ -250,7 +250,7 @@ class BridgeTowerTransformer(nn.Module):
                 [BridgeTowerResidualAttention(config) for _ in range(self.num_hidden_layers)]
             )
         self.stop_gradient = config.stop_gradient
-        self.print = 0
+        self.print = 1000
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         hidden_states = []
@@ -315,7 +315,7 @@ class BridgeTowerVisionTransformer(nn.Module):
             self.ln_separate = nn.ModuleList(
                 [nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) for _ in range(config.num_hidden_layers)]
             )
-        self.print = 0
+        self.print = 1000
 
     def forward(self, pixel_values: torch.Tensor, attention_mask):
         hidden_states = self.embeddings(pixel_values)
@@ -652,9 +652,8 @@ class BridgeTowerBertCrossLayer(nn.Module):
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         torch.cuda.nvtx.range_push('self attention')
-        if self.print < 100:
-            print (f'BridgeTowerBertCrossLayer hidden_states {hidden_states.shape}-{hidden_states.dtype}')
-            self.print += 1
+        if self.print < 10:
+            print (f'BridgeTowerBertCrossLayer selfAttn input {hidden_states.shape}-{hidden_states.dtype} attn_mask {attention_mask.shape}-{attention_mask.dtype} output_attentions {output_attentions}')
         self_attention_outputs = self.attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -668,6 +667,8 @@ class BridgeTowerBertCrossLayer(nn.Module):
         # if decoder, the last output is tuple of self-attn cache
         # add self attentions if we output attention weights
         outputs = self_attention_outputs[1:]
+        if self.print < 10:
+            print (f'BridgeTowerBertCrossLayer crossattention input {attention_output.shape}-{attention_output.dtype} attn_mask {attention_mask.shape}-{attention_mask.dtype} encoder_hidden_states {encoder_hidden_states.shape}-{encoder_hidden_states.dtype} past_key_value {past_key_value} output_attentions {output_attentions}')
         torch.cuda.nvtx.range_push('cross attention')
         cross_attention_outputs = self.crossattention(
             attention_output,
@@ -694,6 +695,9 @@ class BridgeTowerBertCrossLayer(nn.Module):
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
+        if self.print < 10:
+            print (f'BridgeTowerBertCrossLayer intermediate+output input {attention_output.shape}-{attention_output.dtype} layer_output {layer_output.shape}-{layer_output.dtype}')
+            self.print += 1
         return layer_output
 
 
@@ -711,7 +715,7 @@ class BridgeTowerTextLayer(nn.Module):
             self.crossattention = BridgeTowerAttention(config, position_embedding_type="absolute")
         self.intermediate = BridgeTowerIntermediate(config)
         self.output = BridgeTowerOutput(config)
-        self.print = 0
+        self.print = 1000
 
     def forward(
         self,
