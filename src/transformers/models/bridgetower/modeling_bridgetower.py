@@ -14,6 +14,7 @@
 # limitations under the License.
 """PyTorch BridgeTower Model"""
 
+import os
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1227,6 +1228,9 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         self.vision_model = BridgeTowerVisionModel(vision_config)
 
         self.text_model = BridgeTowerTextModel(text_config)
+        self.overlap_text_vision_layers = (os.getenv('OVERLAP_TEXT_VISION_CUDA', "0") == "1")
+        if self.overlap_text_vision_layers:
+            self.text_model_stream = torch.cuda.Stream()
 
         if not vision_config.share_layernorm and config.init_layernorm_from_vision_encoder:
             for ln in self.vision_model.visual.cross_modal_ln_separate:
@@ -1329,6 +1333,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         image_token_type_idx = image_token_type_idx if image_token_type_idx else 1
         input_shape = input_ids.size()
+
         text_embeds = self.text_model.embeddings(input_ids=input_ids)
 
         if output_hidden_states:
@@ -1343,13 +1348,6 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         # The split_index determines how many layers of the uni-modal encoder are applied before the cross-modal encoder
         split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
 
-        # Run the first 'split_index' layers of the textual encoder
-        for layer in self.text_model.encoder.layer[:split_index]:
-            text_embeds = layer(text_embeds, extend_text_masks)[0]
-
-            if output_hidden_states:
-                all_hidden_states_text += (text_embeds,)
-
         if image_embeds is None:
             image_embeds = self.vision_model.visual.forward_pre(pixel_values.type(self.vision_model.dtype))
         else:
@@ -1359,11 +1357,34 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         if output_hidden_states:
             all_hidden_states_image += (image_embeds,)
 
-        # Run the first 'split_index' layers of the visual encoder
-        for block in self.vision_model.visual.transformer.resblocks[:split_index]:
-            image_embeds = block(image_embeds)
-            if output_hidden_states:
-                all_hidden_states_image += (image_embeds,)
+        if not self.overlap_text_vision_layers:
+            # Run the first 'split_index' layers of the textual encoder
+            for layer in self.text_model.encoder.layer[:split_index]:
+                text_embeds = layer(text_embeds, extend_text_masks)[0]
+
+                if output_hidden_states:
+                    all_hidden_states_text += (text_embeds,)
+
+            # Run the first 'split_index' layers of the visual encoder
+            for block in self.vision_model.visual.transformer.resblocks[:split_index]:
+                image_embeds = block(image_embeds)
+                if output_hidden_states:
+                    all_hidden_states_image += (image_embeds,)
+
+        else:
+            # Run the first 'split_index' layers of textual and visual encoder layers
+            for i, layer in enumerate(self.text_model.encoder.layer[:split_index]):
+                block = self.vision_model.visual.transformer.resblocks[i]
+
+                self.text_model_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.text_model_stream):
+                    text_embeds = layer(text_embeds, extend_text_masks)[0]
+                image_embeds = block(image_embeds)
+                torch.cuda.current_stream().wait_stream(self.text_model_stream)
+
+                if output_hidden_states:
+                    all_hidden_states_text += (text_embeds,)
+                    all_hidden_states_image += (image_embeds,)
 
         image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))
 
@@ -1422,10 +1443,19 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         #  Each of the top 6 layers of the visual and textual encoders ([split_index:]) is connected to each layer of
         #  the cross-modal encoder via bridge layers, which brings bottom-up alignment and fusion to the cross-modal encoder.
         for i in range(split_index, len(self.text_model.encoder.layer)):
-            text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks)[0]
-            image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds).type(
-                self.vision_model.dtype
-            )
+            if not self.overlap_text_vision_layers:
+                text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks)[0]
+                image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds).type(
+                    self.vision_model.dtype
+                )
+            else:
+                self.text_model_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.text_model_stream):
+                    text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks)[0]
+                image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds).type(
+                    self.vision_model.dtype
+                )
+                torch.cuda.current_stream().wait_stream(self.text_model_stream)
             image_embeds_with_ln = (
                 self.cross_modal_image_transform(self.vision_model.visual.forward_post(image_embeds))
                 + image_token_type_embeddings
