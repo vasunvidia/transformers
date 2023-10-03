@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import io
 import inspect
 from typing import Callable, List, Optional, Set, Tuple, Union
 
@@ -285,7 +286,16 @@ def id_tensor_storage(tensor: torch.Tensor) -> Tuple[torch.device, int, int]:
     guaranteed to be unique and constant for this tensor's storage during its lifetime. Two tensor storages with
     non-overlapping lifetimes may have the same id.
     """
-    if tensor.device.type == "xla" and is_torch_tpu_available():
+    if not isinstance(tensor, torch.Tensor):
+        if isinstance(tensor, io.BytesIO):
+            tensor.seek(0)
+            tensor = torch.load(tensor, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+            if tensor is None:
+                return None
+            unique_id = storage_ptr(tensor)
+        else:
+            return None
+    elif tensor.device.type == "xla" and is_torch_tpu_available():
         # NOTE: xla tensors dont have storage
         # use some other unique id to distinguish.
         # this is a XLA tensor, it must be created using torch_xla's

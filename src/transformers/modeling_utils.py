@@ -323,10 +323,12 @@ def shard_checkpoint(
     for key, weight in state_dict.items():
         # when bnb serialization is used the weights in the state dict can be strings
         # check: https://github.com/huggingface/transformers/pull/24416 for more details
-        if isinstance(weight, str):
+        if not isinstance(weight, torch.Tensor):
             continue
         else:
             storage_id = id_tensor_storage(weight)
+            if storage_id is None:
+                continue
 
         # If a `weight` shares the same underlying storage as another tensor, we put `weight` in the same `block`
         if storage_id in storage_id_to_block:
@@ -3393,7 +3395,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             ptrs = collections.defaultdict(list)
             for name, tensor in model.state_dict().items():
                 id_tensor = id_tensor_storage(tensor)
-                ptrs[id_tensor].append(name)
+                if id_tensor is not None:
+                    ptrs[id_tensor].append(name)
 
             # These are all the pointers of shared tensors.
             tied_params = [names for _, names in ptrs.items() if len(names) > 1]
