@@ -138,6 +138,9 @@ USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
 
 # NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
 USE_NVTE_ALL = False
+USE_NVTE_RESIDUAL_ATTN = False
+USE_NVTE_SELF_ATTN = False
+USE_NVTE_ATTENTION = False
 
 @dataclass
 class BridgeTowerModelOutput(ModelOutput):
