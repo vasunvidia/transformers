@@ -127,9 +127,6 @@ BRIDGETOWER_INPUTS_DOCSTRING = r"""
 # Global TE integration flag
 USE_NVTE_ALL=bool(os.getenv('USE_NVTE_ALL'))
 
-# NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
-USE_NVTE_ALL = False
-
 # TE integration flags per layer (superceded by global flag)
 USE_NVTE_RESIDUAL_ATTN=bool(os.getenv('USE_NVTE_RESIDUAL_ATTN')) or USE_NVTE_ALL
 USE_NVTE_SELF_ATTN=bool(os.getenv('USE_NVTE_SELF_ATTN')) or USE_NVTE_ALL
@@ -139,6 +136,8 @@ USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
 USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR')) or USE_NVTE_ALL
 USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
 
+# NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
+USE_NVTE_ALL = False
 
 @dataclass
 class BridgeTowerModelOutput(ModelOutput):
@@ -343,9 +342,9 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
                 input_param = state_dict[key]
                 # pre-matmul QKV projection weight/bias
                 if key == prefix + "in_proj_weight":
-                    module.nvte_mha.layernorm_qkv.weight.copy_(input_param)
+                    module.nvte_mha.qkv.weight.copy_(input_param)
                 elif key == prefix + "in_proj_bias":
-                    module.nvte_mha.layernorm_qkv.bias.copy_(input_param)
+                    module.nvte_mha.qkv.bias.copy_(input_param)
                 # post-matmul QKV projection weight/bias
                 elif key == prefix + "out_proj.weight":
                     module.nvte_mha.proj.weight.copy_(input_param)
@@ -377,7 +376,7 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
 
 
 RESIDUAL_ATTN_PARENT=BridgeTowerResidualAttention_Original
-if USE_NVTE_RESIDUAL_ATTN:
+if USE_NVTE_ALL or USE_NVTE_RESIDUAL_ATTN:
     RESIDUAL_ATTN_PARENT=BridgeTowerResidualAttention_NVTE
 class BridgeTowerResidualAttention(RESIDUAL_ATTN_PARENT, nn.Module):
     def __init__(self, config):
