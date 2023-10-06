@@ -271,7 +271,7 @@ class BridgeTowerResidualAttention_Original(nn.Module):
                         elif key == prefix + "mlp.c_proj.bias":
                             module.layernorm_mlp.fc2_bias.copy_(input_param)
                             
-                self.pre_hook = self._register_load_state_dict_pre_hook(nvte_load_states_layernorm_mlp, with_module=True)
+                self._register_load_state_dict_pre_hook(nvte_load_states_layernorm_mlp, with_module=True)
             else:
                 self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
@@ -323,11 +323,8 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
             config.hidden_size,
             config.hidden_size // 64,
             fuse_qkv_params=True,
-            attn_mask_type="padding",
             qkv_weight_interleaved=False,
-            input_layernorm=False,
-            init_method=te.utils.init_method_normal(attn_std*config.initializer_factor),
-            output_layer_init_method=te.utils.init_method_normal(proj_std*config.initializer_factor)
+            input_layernorm=False
         )
         # NOTE: We fuse the LayerNorm -> Linear -> Activation -> Linear sequence with te.LayerNormMLP.
         self.layernorm_mlp = te.module.LayerNormMLP(
@@ -368,7 +365,7 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
                 elif key == prefix + "mlp.c_proj.bias":
                     module.layernorm_mlp.fc2_bias.copy_(input_param)
                     
-        self.pre_hook = self._register_load_state_dict_pre_hook(nvte_load_states_residual_attn, with_module=True)
+        self._register_load_state_dict_pre_hook(nvte_load_states_residual_attn, with_module=True)
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor = None):
         if attention_mask is not None:
@@ -1005,7 +1002,7 @@ class BridgeTowerAttention_NVTE(nn.Module):
                 elif key == prefix + "output.LayerNorm.bias":
                     module.output_layernorm.bias.copy_(input_param)
                     
-        self.pre_hook = self._register_load_state_dict_pre_hook(nvte_load_states_self_attn, with_module=True)
+        self._register_load_state_dict_pre_hook(nvte_load_states_self_attn, with_module=True)
 
     def prune_heads(self, heads):
         pass
@@ -1426,10 +1423,9 @@ class BridgeTowerPreTrainedModel(PreTrainedModel):
                 for block in module.visual.transformer.resblocks:
                     nn.init.normal_(block.attn.in_proj_weight, std=attn_std * self.config.initializer_factor)
                     nn.init.normal_(block.attn.out_proj.weight, std=proj_std * self.config.initializer_factor)
-            if not (USE_NVTE_LINEAR and USE_NVTE_LAYERNORM):
-                for block in module.visual.transformer.resblocks:
-                    nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
-                    nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
+                    if not (USE_NVTE_LINEAR and USE_NVTE_LAYERNORM):
+                        nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
+                        nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
 
             nn.init.normal_(module.visual.embeddings.class_embedding, std=attn_std * self.config.initializer_factor)
             nn.init.normal_(
