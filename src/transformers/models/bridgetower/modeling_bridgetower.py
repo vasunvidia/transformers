@@ -125,20 +125,20 @@ BRIDGETOWER_INPUTS_DOCSTRING = r"""
 """
 
 # Global TE integration flag
-USE_NVTE_ALL=bool(os.getenv('USE_NVTE_ALL'))
+USE_NVTE_ALL=bool(os.getenv('USE_NVTE_ALL', '0'))
 
 # TE integration flags per layer (superceded by global flag)
-USE_NVTE_RESIDUAL_ATTN=bool(os.getenv('USE_NVTE_RESIDUAL_ATTN')) or USE_NVTE_ALL
-USE_NVTE_SELF_ATTN=bool(os.getenv('USE_NVTE_SELF_ATTN')) or USE_NVTE_ALL
-USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
-USE_NVTE_INTERMEDIATE=bool(os.getenv('USE_NVTE_INTERMEDIATE')) or USE_NVTE_ALL
-USE_NVTE_OUTPUT=bool(os.getenv('USE_NVTE_OUTPUT')) or USE_NVTE_ALL
-USE_NVTE_POOLER=bool(os.getenv('USE_NVTE_POOLER')) or USE_NVTE_ALL
-USE_NVTE_PRED_HEAD=bool(os.getenv('USE_NVTE_PRED_HEAD')) or USE_NVTE_ALL
+USE_NVTE_RESIDUAL_ATTN=bool(os.getenv('USE_NVTE_RESIDUAL_ATTN', '0')) or USE_NVTE_ALL
+USE_NVTE_SELF_ATTN=bool(os.getenv('USE_NVTE_SELF_ATTN', '0')) or USE_NVTE_ALL
+USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION', '0')) or USE_NVTE_ALL
+USE_NVTE_INTERMEDIATE=bool(os.getenv('USE_NVTE_INTERMEDIATE', '0')) or USE_NVTE_ALL
+USE_NVTE_OUTPUT=bool(os.getenv('USE_NVTE_OUTPUT', '0')) or USE_NVTE_ALL
+USE_NVTE_POOLER=bool(os.getenv('USE_NVTE_POOLER', '0')) or USE_NVTE_ALL
+USE_NVTE_PRED_HEAD=bool(os.getenv('USE_NVTE_PRED_HEAD', '0')) or USE_NVTE_ALL
 
 # TE integration flags for core operations (superceded by per-layer flags)
-USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR')) or USE_NVTE_ALL
-USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
+USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR', '0')) or USE_NVTE_ALL
+USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM', '0')) or USE_NVTE_ALL
 
 # NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
 USE_NVTE_ALL = False
@@ -280,7 +280,7 @@ class BridgeTowerResidualAttention_Original(nn.Module):
             else:
                 self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
-            self.ln_1 = nvte_load_states_layernorm_mlp.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.attn_mask = None
@@ -326,9 +326,8 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
         self.attn_with_input_layernorm = te.MultiheadAttention(
             config.hidden_size,
             config.hidden_size // 64,
-            attention_dropout=0.0,
-            attn_mask_type="padding",
-            qkv_format="bshd",
+            fuse_qkv_params=True,
+            qkv_weight_interleaved=False,
             input_layernorm=True,
             layernorm_epsilon=config.layer_norm_eps,
             init_method=te.utils.init_method_normal(attn_std*config.initializer_factor),
