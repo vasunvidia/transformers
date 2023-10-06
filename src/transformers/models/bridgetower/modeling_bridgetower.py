@@ -18,7 +18,7 @@ import os
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Mapping, Any
 
 import torch
 import torch.utils.checkpoint
@@ -129,6 +129,7 @@ USE_NVTE_ALL=bool(os.getenv('USE_NVTE_ALL'))
 
 # TE integration flags per layer (superceded by global flag)
 USE_NVTE_RESIDUAL_ATTN=bool(os.getenv('USE_NVTE_RESIDUAL_ATTN')) or USE_NVTE_ALL
+USE_NVTE_SELF_ATTN=bool(os.getenv('USE_NVTE_SELF_ATTN')) or USE_NVTE_ALL
 USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
 USE_NVTE_INTERMEDIATE=bool(os.getenv('USE_NVTE_INTERMEDIATE')) or USE_NVTE_ALL
 USE_NVTE_OUTPUT=bool(os.getenv('USE_NVTE_OUTPUT')) or USE_NVTE_ALL
@@ -138,7 +139,12 @@ USE_NVTE_PRED_HEAD=bool(os.getenv('USE_NVTE_PRED_HEAD')) or USE_NVTE_ALL
 # TE integration flags for core operations (superceded by per-layer flags)
 USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR')) or USE_NVTE_ALL
 USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
-USE_NVTE_ACTIVATION=bool(os.getenv('USE_NVTE_ACTIVATION')) or USE_NVTE_ALL
+
+# NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
+USE_NVTE_ALL = False
+USE_NVTE_RESIDUAL_ATTN = False
+USE_NVTE_SELF_ATTN = False
+USE_NVTE_ATTENTION = False
 
 
 @dataclass
@@ -212,45 +218,71 @@ class BridgeTowerResidualAttention_Original(nn.Module):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(config.hidden_size, config.hidden_size // 64)
-        if USE_NVTE_LAYERNORM:
-            self.ln_1 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        else:
-            self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if USE_NVTE_ACTIVATION:
-            activation = te.jit.gelu_fused_
-        else:
-            activation = QuickGELUActivation()
+        fc_std = (2 * config.hidden_size) ** -0.5
+        
         if USE_NVTE_LINEAR:
-            fc_std = (2 * config.hidden_size) ** -0.5
-            self.mlp = nn.ModuleDict(
-                OrderedDict(
-                    [
-                        ("c_fc", te.Linear(
-                            config.hidden_size, config.hidden_size * 4,
-                            init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
-                        )),
-                        ("gelu", activation),
-                        ("c_proj", te.Linear(
-                            config.hidden_size * 4, config.hidden_size,
-                            init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
-                        )),
-                    ]
+            if not USE_NVTE_LAYERNORM:
+                self.mlp = nn.ModuleDict(
+                    OrderedDict(
+                        [
+                            ("c_fc", te.Linear(
+                                config.hidden_size, config.hidden_size * 4,
+                                init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
+                            )),
+                            ("gelu", QuickGELUActivation()),
+                            ("c_proj", te.Linear(
+                                config.hidden_size * 4, config.hidden_size,
+                                init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
+                            )),
+                        ]
+                    )
                 )
-            )
         else:
             self.mlp = nn.ModuleDict(
                 OrderedDict(
                     [
                         ("c_fc", nn.Linear(config.hidden_size, config.hidden_size * 4)),
-                        ("gelu", activation),
+                        ("gelu", QuickGELUActivation()),
                         ("c_proj", nn.Linear(config.hidden_size * 4, config.hidden_size)),
                     ]
                 )
             )
+
         if USE_NVTE_LAYERNORM:
-            self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            self.ln_1 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            if USE_NVTE_LINEAR:
+                self.layernorm_mlp = te.module.LayerNormMLP(
+                    config.hidden_size,
+                    config.hidden_size * 4,
+                    eps=config.layer_norm_eps,
+                    init_method=te.utils.init_method_normal(fc_std*config.initializer_factor),
+                    output_layer_init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
+                )
+                @torch.no_grad()
+                def nvte_load_states_layernorm_mlp(module, state_dict, prefix, local_metadata, strict,
+                                                missing_keys, unexpected_keys, error_msgs):
+                    for key in state_dict.keys():
+                        input_param = state_dict[key]
+                        if key == prefix + "ln_2.weight":
+                            module.layernorm_mlp.layer_norm_weight.copy_(input_param)
+                        elif key == prefix + "ln_2.bias":
+                            module.layernorm_mlp.layer_norm_bias.copy_(input_param)
+                        elif key == prefix + "mlp.c_fc.weight":
+                            module.layernorm_mlp.fc1_weight.copy_(input_param)
+                        elif key == prefix + "mlp.c_fc.bias":
+                            module.layernorm_mlp.fc1_bias.copy_(input_param)
+                        elif key == prefix + "mlp.c_proj.weight":
+                            module.layernorm_mlp.fc2_weight.copy_(input_param)
+                        elif key == prefix + "mlp.c_proj.bias":
+                            module.layernorm_mlp.fc2_bias.copy_(input_param)
+                            
+                self.pre_hook = self._register_load_state_dict_pre_hook(nvte_load_states_layernorm_mlp, with_module=True)
+            else:
+                self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
+            self.ln_1 = nvte_load_states_layernorm_mlp.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
         self.attn_mask = None
 
     def attention(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor):
@@ -272,9 +304,12 @@ class BridgeTowerResidualAttention_Original(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor = None):
         residual_state = hidden_state + self.attention(self.ln_1(hidden_state), attention_mask)
-        hidden_state = self.ln_2(residual_state)
-        for _, layer in self.mlp.items():
-            hidden_state = layer(hidden_state)
+        if USE_NVTE_LINEAR and USE_NVTE_LAYERNORM:
+            hidden_state = self.layernorm_mlp(residual_state)
+        else:
+            hidden_state = self.ln_2(residual_state)
+            for _, layer in self.mlp.items():
+                hidden_state = layer(hidden_state)
         hidden_state = residual_state + hidden_state
         return hidden_state
 
@@ -307,6 +342,43 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
             init_method=te.utils.init_method_normal(fc_std*config.initializer_factor),
             output_layer_init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
         )
+        
+        @torch.no_grad()
+        def nvte_load_states_residual_attn(module, state_dict, prefix, local_metadata, strict,
+                                           missing_keys, unexpected_keys, error_msgs):
+            for key in state_dict.keys():
+                input_param = state_dict[key]
+                # input layernorm weight/bias
+                if key == prefix + "ln_1.weight":
+                    module.attn_with_input_layernorm.layernorm_qkv.layer_norm_weight.copy_(input_param)
+                elif key == prefix + "ln_1.bias":
+                    module.attn_with_input_layernorm.layernorm_qkv.layer_norm_bias.copy_(input_param)
+                # pre-matmul QKV projection weight/bias
+                elif key == prefix + "in_proj_weight":
+                    module.attn_with_input_layernorm.layernorm_qkv.weight.copy_(input_param)
+                elif key == prefix + "in_proj_bias":
+                    module.attn_with_input_layernorm.layernorm_qkv.bias.copy_(input_param)
+                # post-matmul QKV projection weight/bias
+                elif key == prefix + "out_proj.weight":
+                    module.attn_with_input_layernorm.proj.weight.copy_(input_param)
+                elif key == prefix + "out_proj.bias":
+                    module.attn_with_input_layernorm.proj.bias.copy_(input_param)
+                # output layernorm weight/bias
+                elif key == prefix + "ln_2.weight":
+                    module.layernorm_mlp.layer_norm_weight.copy_(input_param)
+                elif key == prefix + "ln_2.bias":
+                    module.layernorm_mlp.layer_norm_bias.copy_(input_param)
+                # MLP block fully-connected layers weights/biases
+                elif key == prefix + "mlp.c_fc.weight":
+                    module.layernorm_mlp.fc1_weight.copy_(input_param)
+                elif key == prefix + "mlp.c_fc.bias":
+                    module.layernorm_mlp.fc1_bias.copy_(input_param)
+                elif key == prefix + "mlp.c_proj.weight":
+                    module.layernorm_mlp.fc2_weight.copy_(input_param)
+                elif key == prefix + "mlp.c_proj.bias":
+                    module.layernorm_mlp.fc2_bias.copy_(input_param)
+                    
+        self.pre_hook = self._register_load_state_dict_pre_hook(nvte_load_states_residual_attn, with_module=True)
 
     def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor = None):
         if attention_mask is not None:
@@ -496,13 +568,10 @@ class BridgeTowerIntermediate(nn.Module):
             )
         else:
             self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if USE_NVTE_ACTIVATION:
-            self.intermediate_act_fn = te.jit.gelu_fused_
+        if isinstance(config.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
-            if isinstance(config.hidden_act, str):
-                self.intermediate_act_fn = ACT2FN[config.hidden_act]
-            else:
-                self.intermediate_act_fn = config.hidden_act
+            self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -559,7 +628,7 @@ class BridgeTowerPooler(nn.Module):
 
 
 # Copied from transformers.models.roberta.modeling_roberta.RobertaSelfAttention with Roberta->BridgeTower
-class BridgeTowerSelfAttention(nn.Module):
+class BridgeTowerSelfAttention_Original(nn.Module):
     def __init__(self, config, position_embedding_type=None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
@@ -710,6 +779,106 @@ class BridgeTowerSelfAttention(nn.Module):
         return outputs
 
 
+class BridgeTowerSelfAttention_NVTE(nn.Module):
+    def __init__(self, config, position_embedding_type=None):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.is_decoder = config.is_decoder
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        
+        self.query = te.Linear(
+            config.hidden_size,
+            self.all_head_size,
+            init_method=te.utils.init_method_normal(0.05*config.initializer_factor)
+        )
+        self.key = te.Linear(
+            config.hidden_size,
+            self.all_head_size,
+            init_method=te.utils.init_method_normal(0.05*config.initializer_factor)
+        )
+        self.value = te.Linear(
+            config.hidden_size,
+            self.all_head_size,
+            init_method=te.utils.init_method_normal(0.05*config.initializer_factor)
+        )
+        
+        self.core_attention = te.DotProductAttention(
+            self.num_attention_heads,
+            self.attention_head_size,
+            attention_type="cross" if self.is_decoder else "self",
+            attention_dropout=config.attention_probs_dropout_prob,
+            qkv_format="bshd"
+        )
+
+        self.position_embedding_type = position_embedding_type or getattr(
+            config, "position_embedding_type", "absolute"
+        )
+        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
+            self.max_position_embeddings = config.max_position_embeddings
+            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        query_layer = self.query(hidden_states)
+        is_cross_attention = encoder_hidden_states is not None
+        if is_cross_attention:
+            hidden_states_pick = encoder_hidden_states
+            attn_mask_pick = encoder_attention_mask
+        else:
+            hidden_states_pick = hidden_states
+            attn_mask_pick = attention_mask
+        key_layer = self.key(hidden_states_pick)
+        value_layer = self.value(hidden_states_pick)
+
+        query_layer = query_layer.view(query_layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+        key_layer = key_layer.view(key_layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+        value_layer = value_layer.view(value_layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+
+        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
+            position_ids_l = torch.arange(query_layer.size, dtype=torch.long, device=hidden_states.device).view(-1, 1)
+            position_ids_r = torch.arange(key_layer.size, dtype=torch.long, device=hidden_states.device).view(1, -1)
+            distance = position_ids_l - position_ids_r
+            q_pos_emb, k_pos_emb = self.distance_embedding(distance + self.max_position_embeddings - 1)
+            key_layer = te.attention.apply_rotary_pos_emb(key_layer, k_pos_emb)
+            if self.position_embedding_type == "relative_key_query":
+                query_layer = te.attention.apply_rotary_pos_emb(query_layer, q_pos_emb)
+
+        context_layer = self.core_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_mask=attn_mask_pick.permute(3, 1, 2, 0).bool()
+        )
+        
+        outputs = (context_layer,)
+        if self.is_decoder:
+            outputs = outputs + (past_key_value,)
+        return outputs
+
+
+SELF_ATTN_PARENT=BridgeTowerSelfAttention_Original
+if USE_NVTE_ALL or USE_NVTE_SELF_ATTN:
+    SELF_ATTN_PARENT=BridgeTowerSelfAttention_NVTE
+class BridgeTowerSelfAttention(SELF_ATTN_PARENT, nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
 # Copied from transformers.models.bert.modeling_bert.BertAttention with Bert->BridgeTower
 class BridgeTowerAttention_Original(nn.Module):
     def __init__(self, config, position_embedding_type=None):
@@ -717,6 +886,30 @@ class BridgeTowerAttention_Original(nn.Module):
         self.self = BridgeTowerSelfAttention(config, position_embedding_type=position_embedding_type)
         self.output = BridgeTowerSelfOutput(config)
         self.pruned_heads = set()
+        
+    def nvte_prune_linear_layer(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) -> nn.Module:
+        if USE_NVTE_ALL or USE_NVTE_SELF_ATTN or USE_NVTE_LINEAR:
+            # NOTE: Copied from transformers.pytorch_utils.prune_linear_layer
+            index = index.to(layer.weight.device)
+            W = layer.weight.index_select(dim, index).clone().detach()
+            if layer.bias is not None:
+                if dim == 1:
+                    b = layer.bias.clone().detach()
+                else:
+                    b = layer.bias[index].clone().detach()
+            new_size = list(layer.weight.size())
+            new_size[dim] = len(index)
+            new_layer = te.Linear(new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight.device)
+            new_layer.weight.requires_grad = False
+            new_layer.weight.copy_(W.contiguous())
+            new_layer.weight.requires_grad = True
+            if layer.bias is not None:
+                new_layer.bias.requires_grad = False
+                new_layer.bias.copy_(b.contiguous())
+                new_layer.bias.requires_grad = True
+            return new_layer
+        else:
+            return prune_linear_layer(layer, index, dim=dim)
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -726,10 +919,10 @@ class BridgeTowerAttention_Original(nn.Module):
         )
 
         # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+        self.self.query = self.nvte_prune_linear_layer(self.self.query, index)
+        self.self.key = self.nvte_prune_linear_layer(self.self.key, index)
+        self.self.value = self.nvte_prune_linear_layer(self.self.value, index)
+        self.output.dense = self.nvte_prune_linear_layer(self.output.dense, index, dim=1)
 
         # Update hyper params and store pruned heads
         self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
@@ -767,17 +960,51 @@ class BridgeTowerAttention_NVTE(nn.Module):
         #       it needs a separate past key/value state concatenation at the end.
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
-        self.self = te.MultiheadAttention(
+        self.qkv_plus_self_attn = te.MultiheadAttention(
             config.hidden_size,
             config.num_attention_heads,
             qkv_format="bshd",
             input_layernorm=False,
+            attention_dropout=config.attention_probs_dropout_prob,
             attention_type="cross" if self.is_decoder and self.add_cross_attention else "self",
             init_method=te.utils.init_method_normal(0.05*config.initializer_factor),
-            output_layer_init_method=te.utils.init_method_normal(0.05*config.initializer_factor)
+            output_layer_init_method=te.utils.init_method_normal(0.05*config.initializer_factor),
+            
         )
-        self.output = BridgeTowerSelfOutput(config)
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.output_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pruned_heads = set()
+        
+        @torch.no_grad()
+        def nvte_load_states_self_attn(module, state_dict, prefix, local_metadata, strict,
+                                       missing_keys, unexpected_keys, error_msgs):
+            for key in state_dict.keys():
+                input_param = state_dict[key]
+                # pre-matmul QKV weight/bias
+                if key == prefix + "self.query.weight":
+                    module.qkv_plus_self_attn.qkv.query_weight.copy_(input_param)
+                elif key == prefix + "self.query.bias":
+                    module.qkv_plus_self_attn.qkv.query_bias.copy_(input_param)
+                elif key == prefix + "self.key.weight":
+                    module.qkv_plus_self_attn.qkv.key_weight.copy_(input_param)
+                elif key == prefix + "self.key.bias":
+                    module.qkv_plus_self_attn.qkv.key_bias.copy_(input_param)
+                elif key == prefix + "self.value.weight":
+                    module.qkv_plus_self_attn.qkv.value_weight.copy_(input_param)
+                elif key == prefix + "self.value.bias":
+                    module.qkv_plus_self_attn.qkv.value_bias.copy_(input_param)
+                # post-matmul QKV projection weight/bias
+                elif key == prefix + "output.dense.weight":
+                    module.qkv_plus_self_attn.proj.weight.copy_(input_param)
+                elif key == prefix + "output.dense.bias":
+                    module.qkv_plus_self_attn.proj.bias.copy_(input_param)
+                # output layernorm weight/bias
+                elif key == prefix + "output.LayerNorm.weight":
+                    module.output_layernorm.weight.copy_(input_param)
+                elif key == prefix + "output.LayerNorm.bias":
+                    module.output_layernorm.bias.copy_(input_param)
+                    
+        self.pre_hook = self._register_load_state_dict_pre_hook(nvte_load_states_self_attn, with_module=True)
 
     def prune_heads(self, heads):
         pass
@@ -793,9 +1020,10 @@ class BridgeTowerAttention_NVTE(nn.Module):
         output_attentions: Optional[bool] = False,  # NOTE: This is never used so we ignore it
     ) -> Tuple[torch.Tensor]:
         # te.MultiheadAttention
-        self_outputs = self.self(
+        attn_mask_pick = encoder_attention_mask if encoder_hidden_states is not None and self.is_decoder else attention_mask
+        self_outputs = self.qkv_plus_self_attn(
             hidden_states,
-            attention_mask=attention_mask if encoder_hidden_states is None else encoder_attention_mask,
+            attention_mask=attn_mask_pick,
             encoder_output=encoder_hidden_states
         )
         # original implementation always outputs a tuple out of the multihead attention code
@@ -805,13 +1033,13 @@ class BridgeTowerAttention_NVTE(nn.Module):
         if self.is_decoder:
             self_outputs = self_outputs + (past_key_value,)
 
-        attention_output = self.output(self_outputs[0], hidden_states)
+        attention_output = self.output_layernorm(self.output_dropout(self_outputs[0]) + hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
 
 ATTENTION_PARENT=BridgeTowerAttention_Original
-if USE_NVTE_ATTENTION:
+if USE_NVTE_ALL or USE_NVTE_ATTENTION:
     ATTENTION_PARENT=BridgeTowerAttention_NVTE
 class BridgeTowerAttention(ATTENTION_PARENT, nn.Module):
     def __init__(self, *args, **kwargs):
@@ -1194,18 +1422,13 @@ class BridgeTowerPreTrainedModel(PreTrainedModel):
             attn_std = module.visual.transformer.hidden_size**-0.5
             fc_std = (2 * module.visual.transformer.hidden_size) ** -0.5
             if not (USE_NVTE_RESIDUAL_ATTN):
-                # the initializations below are replicated in the __init__() calls of all NVTE implementations
                 for block in module.visual.transformer.resblocks:
                     nn.init.normal_(block.attn.in_proj_weight, std=attn_std * self.config.initializer_factor)
                     nn.init.normal_(block.attn.out_proj.weight, std=proj_std * self.config.initializer_factor)
+            if not (USE_NVTE_LINEAR and USE_NVTE_LAYERNORM):
+                for block in module.visual.transformer.resblocks:
                     nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
                     nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
-            else:
-                for block in module.visual.transformer.resblocks:
-                    nn.init.normal_(block.attn_with_input_layernorm.layernorm_qkv.weight_tensor, std=attn_std * self.config.initializer_factor)
-                    nn.init.normal_(block.attn_with_input_layernorm.proj.weight_tensor, std=proj_std * self.config.initializer_factor)
-                    nn.init.normal_(block.layernorm_mlp.fc1_weight, std=fc_std * self.config.initializer_factor)
-                    nn.init.normal_(block.layernorm_mlp.fc2_weight, std=fc_std * self.config.initializer_factor)
 
             nn.init.normal_(module.visual.embeddings.class_embedding, std=attn_std * self.config.initializer_factor)
             nn.init.normal_(
@@ -1791,13 +2014,10 @@ class BridgeTowerPredictionHeadTransform(nn.Module):
         else:
             self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        if USE_NVTE_PRED_HEAD or USE_NVTE_ACTIVATION:
-            self.transform_act_fn = te.jit.gelu_fused_
+        if isinstance(config.hidden_act, str):
+            self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
-            if isinstance(config.hidden_act, str):
-                self.transform_act_fn = ACT2FN[config.hidden_act]
-            else:
-                self.transform_act_fn = config.hidden_act
+            self.transform_act_fn = config.hidden_act
             
 
     def forward(self, hidden_states):
