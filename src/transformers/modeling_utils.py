@@ -3357,6 +3357,42 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 return key.replace("gamma", "weight")
             return key
 
+        if state_dict is not None:
+            USE_NVTE_ALL = bool(os.getenv('USE_NVTE_ALL',''))
+            # TE integration flags per layer (superceded by global flag)
+            USE_NVTE_RESIDUAL_ATTN = bool(os.getenv('USE_NVTE_RESIDUAL_ATTN','')) or USE_NVTE_ALL
+            def remap_keys_te():
+                old_keys = []
+                new_keys = []
+                for key in state_dict.keys():
+                    new_key = None
+                    key = _fix_key(key)
+                    if 'ln_1.weight' in key:
+                        new_key = key.replace('ln_1.weight', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_weight')
+                    if 'ln_1.bias' in key:
+                        new_key = key.replace('ln_1.bias', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_bias')
+                    if 'attn.in_proj_weight' in key:
+                        new_key = key.replace('attn.in_proj_weight', 'attn_with_input_layernorm.layernorm_qkv.weight')
+                    if 'attn.in_proj_bias' in key:
+                        new_key =  key.replace('attn.in_proj_bias', 'attn_with_input_layernorm.layernorm_qkv.bias')
+                    if 'attn.out_proj.weight' in key:
+                        new_key = key.replace('attn.out_proj.weight', 'attn_with_input_layernorm.proj.weight')
+                    if 'attn.out_proj.bias' in key:
+                        new_key =  key.replace('attn.out_proj.bias', 'attn_with_input_layernorm.proj.bias')
+                    if 'ln_2.weight' in key:
+                        new_key = key.replace('ln_2.weight', 'mlp.c_fc.layer_norm_weight')
+                    if 'ln_2.bias' in key:
+                        new_key = key.replace('ln_2.bias', 'mlp.c_fc.layer_norm_bias')
+                    if new_key:
+                        old_keys.append(key)
+                        new_keys.append(new_key)
+                for old_key, new_key in zip(old_keys, new_keys):
+                    state_dict[new_key] = state_dict.pop(old_key)
+                    if old_key in loaded_keys:
+                        loaded_keys.remove(old_key)
+                        loaded_keys.append(new_key)
+            if USE_NVTE_RESIDUAL_ATTN:
+                remap_keys_te()
         original_loaded_keys = loaded_keys
         loaded_keys = [_fix_key(key) for key in loaded_keys]
 
@@ -3380,6 +3416,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             expected_keys = [".".join([prefix, s]) for s in expected_keys]
 
         missing_keys = list(set(expected_keys) - set(loaded_keys))
+        missing_keys[:] = [key for key in missing_keys if '_extra_state' not in key]
         unexpected_keys = set(loaded_keys) - set(expected_keys)
         # Remove nonpersistent buffers from unexpected keys: they are not in the state dict but will be in the model
         # buffers

@@ -138,7 +138,6 @@ USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
 
 # NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
 USE_NVTE_ALL = False
-USE_NVTE_RESIDUAL_ATTN = False
 USE_NVTE_SELF_ATTN = False
 USE_NVTE_ATTENTION = False
 
@@ -316,62 +315,34 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
             )
         attn_std = config.hidden_size**-0.5
         fc_std = (2 * config.hidden_size) ** -0.5
-        self.ln_1 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # NOTE: Original implementation applies self.ln_1 before nn.MultiheadAttention.
-        #       We reproduce this by passing input_layernorm=True to te.MultiheadAttention.
-        self.nvte_mha = te.MultiheadAttention(
+        self.attn_with_input_layernorm = te.MultiheadAttention(
             config.hidden_size,
             config.hidden_size // 64,
+            attention_dropout=0.0,
+            attn_mask_type="no_mask",
+            input_layernorm=True,
+            layernorm_epsilon=config.layer_norm_eps,
             fuse_qkv_params=True,
             qkv_weight_interleaved=False,
-            input_layernorm=False
         )
-        # NOTE: We fuse the LayerNorm -> Linear -> Activation -> Linear sequence with te.LayerNormMLP.
-        self.layernorm_mlp = te.module.LayerNormMLP(
-            config.hidden_size,
-            config.hidden_size * 4,
-            eps=config.layer_norm_eps,
-            init_method=te.utils.init_method_normal(fc_std*config.initializer_factor),
-            output_layer_init_method=te.utils.init_method_normal(fc_std*config.initializer_factor)
+        self.mlp = nn.ModuleDict(
+            OrderedDict(
+                [
+                    ("c_fc", te.module.LayerNormLinear(config.hidden_size, config.hidden_size * 4, config.layer_norm_eps)),
+                    ("gelu", QuickGELUActivation()),
+                    ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size)),
+                ]
+            )
         )
         
-        @torch.no_grad()
-        def nvte_load_states_residual_attn(module, state_dict, prefix, local_metadata, strict,
-                                           missing_keys, unexpected_keys, error_msgs):
-            for key in state_dict.keys():
-                input_param = state_dict[key]
-                # pre-matmul QKV projection weight/bias
-                if key == prefix + "in_proj_weight":
-                    module.nvte_mha.qkv.weight.copy_(input_param)
-                elif key == prefix + "in_proj_bias":
-                    module.nvte_mha.qkv.bias.copy_(input_param)
-                # post-matmul QKV projection weight/bias
-                elif key == prefix + "out_proj.weight":
-                    module.nvte_mha.proj.weight.copy_(input_param)
-                elif key == prefix + "out_proj.bias":
-                    module.nvte_mha.proj.bias.copy_(input_param)
-                # output layernorm weight/bias
-                elif key == prefix + "ln_2.weight":
-                    module.layernorm_mlp.layer_norm_weight.copy_(input_param)
-                elif key == prefix + "ln_2.bias":
-                    module.layernorm_mlp.layer_norm_bias.copy_(input_param)
-                # MLP block fully-connected layers weights/biases
-                elif key == prefix + "mlp.c_fc.weight":
-                    module.layernorm_mlp.fc1_weight.copy_(input_param)
-                elif key == prefix + "mlp.c_fc.bias":
-                    module.layernorm_mlp.fc1_bias.copy_(input_param)
-                elif key == prefix + "mlp.c_proj.weight":
-                    module.layernorm_mlp.fc2_weight.copy_(input_param)
-                elif key == prefix + "mlp.c_proj.bias":
-                    module.layernorm_mlp.fc2_bias.copy_(input_param)
-                    
-        self._register_load_state_dict_pre_hook(nvte_load_states_residual_attn, with_module=True)
-
     def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor = None):
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool, device=hidden_state.device)
-        residual_state = hidden_state + self.nvte_mha(self.ln_1(hidden_state), attention_mask=attention_mask)
-        hidden_state = hidden_state + self.layernorm_mlp(residual_state)
+        residual_state = hidden_state + self.attn_with_input_layernorm(hidden_state, attention_mask)
+        hidden_state = residual_state
+        for _, layer in self.mlp.items():
+            hidden_state = layer(hidden_state)
+        hidden_state = residual_state + hidden_state
         return hidden_state
 
 
@@ -1419,13 +1390,15 @@ class BridgeTowerPreTrainedModel(PreTrainedModel):
             )
             attn_std = module.visual.transformer.hidden_size**-0.5
             fc_std = (2 * module.visual.transformer.hidden_size) ** -0.5
-            if not (USE_NVTE_RESIDUAL_ATTN):
-                for block in module.visual.transformer.resblocks:
+            for block in module.visual.transformer.resblocks:
+                if not (USE_NVTE_RESIDUAL_ATTN):
                     nn.init.normal_(block.attn.in_proj_weight, std=attn_std * self.config.initializer_factor)
                     nn.init.normal_(block.attn.out_proj.weight, std=proj_std * self.config.initializer_factor)
-                    if not (USE_NVTE_LINEAR and USE_NVTE_LAYERNORM):
-                        nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
-                        nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
+                else:
+                    nn.init.normal_(block.attn_with_input_layernorm.layernorm_qkv.weight, std=attn_std * self.config.initializer_factor)
+                    nn.init.normal_(block.attn_with_input_layernorm.proj.weight, std=proj_std * self.config.initializer_factor)
+                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
+                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
 
             nn.init.normal_(module.visual.embeddings.class_embedding, std=attn_std * self.config.initializer_factor)
             nn.init.normal_(
