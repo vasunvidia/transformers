@@ -3361,28 +3361,55 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             USE_NVTE_ALL = bool(os.getenv('USE_NVTE_ALL',''))
             # TE integration flags per layer (superceded by global flag)
             USE_NVTE_RESIDUAL_ATTN = bool(os.getenv('USE_NVTE_RESIDUAL_ATTN','')) or USE_NVTE_ALL
+            USE_NVTE_TF_LAYER = bool(os.getenv('USE_NVTE_TF_LAYER', '')) or USE_NVTE_ALL
             def remap_keys_te():
                 old_keys = []
                 new_keys = []
                 for key in state_dict.keys():
                     new_key = None
                     key = _fix_key(key)
-                    if 'ln_1.weight' in key:
-                        new_key = key.replace('ln_1.weight', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_weight')
-                    if 'ln_1.bias' in key:
-                        new_key = key.replace('ln_1.bias', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_bias')
-                    if 'attn.in_proj_weight' in key:
-                        new_key = key.replace('attn.in_proj_weight', 'attn_with_input_layernorm.layernorm_qkv.weight')
-                    if 'attn.in_proj_bias' in key:
-                        new_key =  key.replace('attn.in_proj_bias', 'attn_with_input_layernorm.layernorm_qkv.bias')
-                    if 'attn.out_proj.weight' in key:
-                        new_key = key.replace('attn.out_proj.weight', 'attn_with_input_layernorm.proj.weight')
-                    if 'attn.out_proj.bias' in key:
-                        new_key =  key.replace('attn.out_proj.bias', 'attn_with_input_layernorm.proj.bias')
-                    if 'ln_2.weight' in key:
-                        new_key = key.replace('ln_2.weight', 'mlp.c_fc.layer_norm_weight')
-                    if 'ln_2.bias' in key:
-                        new_key = key.replace('ln_2.bias', 'mlp.c_fc.layer_norm_bias')
+                    if not (USE_NVTE_TF_LAYER):
+                        if 'ln_1.weight' in key:
+                            new_key = key.replace('ln_1.weight', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_weight')
+                        if 'ln_1.bias' in key:
+                            new_key = key.replace('ln_1.bias', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_bias')
+                        if 'attn.in_proj_weight' in key:
+                            new_key = key.replace('attn.in_proj_weight', 'attn_with_input_layernorm.layernorm_qkv.weight')
+                        if 'attn.in_proj_bias' in key:
+                            new_key =  key.replace('attn.in_proj_bias', 'attn_with_input_layernorm.layernorm_qkv.bias')
+                        if 'attn.out_proj.weight' in key:
+                            new_key = key.replace('attn.out_proj.weight', 'attn_with_input_layernorm.proj.weight')
+                        if 'attn.out_proj.bias' in key:
+                            new_key =  key.replace('attn.out_proj.bias', 'attn_with_input_layernorm.proj.bias')
+                        if 'ln_2.weight' in key:
+                            new_key = key.replace('ln_2.weight', 'mlp.c_fc.layer_norm_weight')
+                        if 'ln_2.bias' in key:
+                            new_key = key.replace('ln_2.bias', 'mlp.c_fc.layer_norm_bias')
+                    else:
+                        if 'ln_1.weight' in key:
+                            new_key = key.replace('ln_1.weight', 'tf_layer.self_attention.layernorm_qkv.layer_norm_weight')
+                        if 'ln_1.bias' in key:
+                            new_key = key.replace('ln_1.bias', 'tf_layer.self_attention.layernorm_qkv.layer_norm_bias')
+                        if 'attn.in_proj_weight' in key:
+                            new_key = key.replace('attn.in_proj_weight', 'tf_layer.self_attention.layernorm_qkv.weight')
+                        if 'attn.in_proj_bias' in key:
+                            new_key =  key.replace('attn.in_proj_bias', 'tf_layer.self_attention.layernorm_qkv.bias')
+                        if 'attn.out_proj.weight' in key:
+                            new_key = key.replace('attn.out_proj.weight', 'tf_layer.self_attention.proj.weight')
+                        if 'attn.out_proj.bias' in key:
+                            new_key =  key.replace('attn.out_proj.bias', 'tf_layer.self_attention.proj.bias')
+                        if 'ln_2.weight' in key:
+                            new_key = key.replace('ln_2.weight', 'tf_layer.layernorm_mlp.layer_norm_weight')
+                        if 'ln_2.bias' in key:
+                            new_key = key.replace('ln_2.bias', 'tf_layer.layernorm_mlp.layer_norm_bias')
+                        if 'mlp.c_fc.weight' in key:
+                            new_key = key.replace('mlp.c_fc.weight', 'tf_layer.layernorm_mlp.fc1_weight')
+                        if 'mlp.c_fc.bias' in key:
+                            new_key = key.replace('mlp.c_fc.bias', 'tf_layer.layernorm_mlp.fc1_bias')
+                        if 'mlp.c_proj.weight' in key:
+                            new_key = key.replace('mlp.c_proj.weight', 'tf_layer.layernorm_mlp.fc2_weight')
+                        if 'mlp.c_proj.bias' in key:
+                            new_key = key.replace('mlp.c_proj.bias', 'tf_layer.layernorm_mlp.fc2_bias')
                     if new_key:
                         old_keys.append(key)
                         new_keys.append(new_key)

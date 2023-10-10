@@ -129,17 +129,13 @@ USE_NVTE_ALL=bool(os.getenv('USE_NVTE_ALL'))
 
 # TE integration flags per layer (superceded by global flag)
 USE_NVTE_RESIDUAL_ATTN=bool(os.getenv('USE_NVTE_RESIDUAL_ATTN')) or USE_NVTE_ALL
+USE_NVTE_TF_LAYER=bool(os.getenv('USE_NVTE_TF_LAYER')) if USE_NVTE_RESIDUAL_ATTN else False
 USE_NVTE_SELF_ATTN=bool(os.getenv('USE_NVTE_SELF_ATTN')) or USE_NVTE_ALL
 USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
 
 # TE integration flags for core operations (superceded by per-layer flags)
 USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR')) or USE_NVTE_ALL
 USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
-
-# NOTE: Temporarily turning off some flags here to block out faulty NVTE integrations.
-USE_NVTE_ALL = False
-USE_NVTE_SELF_ATTN = False
-USE_NVTE_ATTENTION = False
 
 @dataclass
 class BridgeTowerModelOutput(ModelOutput):
@@ -310,40 +306,52 @@ class BridgeTowerResidualAttention_Original(nn.Module):
 class BridgeTowerResidualAttention_NVTE(nn.Module):
     def __init__(self, config):
         super().__init__()
-        proj_std = (config.hidden_size**-0.5) * (
-                (2 * config.num_hidden_layers) ** -0.5
+        if not(USE_NVTE_TF_LAYER):
+            self.attn_with_input_layernorm = te.MultiheadAttention(
+                config.hidden_size,
+                config.hidden_size // 64,
+                attention_dropout=0.0,
+                attn_mask_type="no_mask",
+                input_layernorm=True,
+                layernorm_epsilon=config.layer_norm_eps,
+                fuse_qkv_params=True,
+                qkv_weight_interleaved=False,
             )
-        attn_std = config.hidden_size**-0.5
-        fc_std = (2 * config.hidden_size) ** -0.5
-        self.attn_with_input_layernorm = te.MultiheadAttention(
-            config.hidden_size,
-            config.hidden_size // 64,
-            attention_dropout=0.0,
-            attn_mask_type="no_mask",
-            input_layernorm=True,
-            layernorm_epsilon=config.layer_norm_eps,
-            fuse_qkv_params=True,
-            qkv_weight_interleaved=False,
-        )
-        self.mlp = nn.ModuleDict(
-            OrderedDict(
-                [
-                    ("c_fc", te.module.LayerNormLinear(config.hidden_size, config.hidden_size * 4, config.layer_norm_eps)),
-                    ("gelu", QuickGELUActivation()),
-                    ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size)),
-                ]
+            self.mlp = nn.ModuleDict(
+                OrderedDict(
+                    [
+                        ("c_fc", te.module.LayerNormLinear(config.hidden_size, config.hidden_size * 4, config.layer_norm_eps)),
+                        ("gelu", QuickGELUActivation()),
+                        ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size)),
+                    ]
+                )
             )
-        )
-        
+        else:
+            self.tf_layer = te.TransformerLayer(
+                config.hidden_size,
+                config.hidden_size * 4,
+                config.hidden_size // 64,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                self_attn_mask_type="no_mask",
+                layernorm_epsilon=config.layer_norm_eps,
+                fuse_qkv_params=True,
+                qkv_weight_interleaved=False
+                
+            )
+
     def forward(self, hidden_state: torch.Tensor, attention_mask: torch.Tensor = None):
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool, device=hidden_state.device)
-        residual_state = hidden_state + self.attn_with_input_layernorm(hidden_state, attention_mask)
-        hidden_state = residual_state
-        for _, layer in self.mlp.items():
-            hidden_state = layer(hidden_state)
-        hidden_state = residual_state + hidden_state
-        return hidden_state
+        if not (USE_NVTE_TF_LAYER):
+            residual_state = hidden_state + self.attn_with_input_layernorm(hidden_state, attention_mask)
+            hidden_state = residual_state
+            for _, layer in self.mlp.items():
+                    hidden_state = layer(hidden_state)
+            hidden_state = residual_state + hidden_state
+            return hidden_state
+        else:
+            return self.tf_layer(hidden_state, attention_mask)
 
 
 RESIDUAL_ATTN_PARENT=BridgeTowerResidualAttention_Original
@@ -1394,11 +1402,19 @@ class BridgeTowerPreTrainedModel(PreTrainedModel):
                 if not (USE_NVTE_RESIDUAL_ATTN):
                     nn.init.normal_(block.attn.in_proj_weight, std=attn_std * self.config.initializer_factor)
                     nn.init.normal_(block.attn.out_proj.weight, std=proj_std * self.config.initializer_factor)
+                    nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
+                    nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
                 else:
-                    nn.init.normal_(block.attn_with_input_layernorm.layernorm_qkv.weight, std=attn_std * self.config.initializer_factor)
-                    nn.init.normal_(block.attn_with_input_layernorm.proj.weight, std=proj_std * self.config.initializer_factor)
-                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
-                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
+                    if not (USE_NVTE_TF_LAYER):
+                        nn.init.normal_(block.attn_with_input_layernorm.layernorm_qkv.weight, std=attn_std * self.config.initializer_factor)
+                        nn.init.normal_(block.attn_with_input_layernorm.proj.weight, std=proj_std * self.config.initializer_factor)
+                        nn.init.normal_(block.mlp.c_fc.weight, std=fc_std * self.config.initializer_factor)
+                        nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
+                    else:
+                        nn.init.normal_(block.tf_layer.self_attention.layernorm_qkv.weight, std=attn_std * self.config.initializer_factor)
+                        nn.init.normal_(block.tf_layer.self_attention.proj.weight, std=proj_std * self.config.initializer_factor)
+                        nn.init.normal_(block.tf_layer.layernorm_mlp.fc1_weight, std=fc_std * self.config.initializer_factor)
+                        nn.init.normal_(block.tf_layer.layernorm_mlp.fc2_weight, std=proj_std * self.config.initializer_factor)
 
             nn.init.normal_(module.visual.embeddings.class_embedding, std=attn_std * self.config.initializer_factor)
             nn.init.normal_(
