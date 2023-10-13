@@ -3358,50 +3358,19 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             return key
 
         if state_dict is not None:
-            USE_NVTE_ALL = bool(os.getenv('USE_NVTE_ALL',''))
-            # TE integration flags per layer (superceded by global flag)
-            USE_NVTE_RESIDUAL_ATTN = bool(os.getenv('USE_NVTE_RESIDUAL_ATTN','')) or USE_NVTE_ALL
-            USE_NVTE_TF_LAYER = bool(os.getenv('USE_NVTE_TF_LAYER', '')) or USE_NVTE_ALL
-            def remap_keys_te():
+            USE_NVTE_ALL = bool(os.getenv('USE_NVTE_ALL'))
+            USE_NVTE_RESIDUAL_ATTN = bool(os.getenv('USE_NVTE_RESIDUAL_ATTN')) or USE_NVTE_ALL
+            USE_NVTE_TF_LAYER = (bool(os.getenv('USE_NVTE_TF_LAYER')) if USE_NVTE_RESIDUAL_ATTN else False) or USE_NVTE_ALL
+
+            def remap_keys_res_te():
                 old_keys = []
                 new_keys = []
                 for key in state_dict.keys():
                     new_key = None
                     key = _fix_key(key)
-                    if not (USE_NVTE_TF_LAYER):
-                        if 'ln_1.weight' in key:
-                            new_key = key.replace('ln_1.weight', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_weight')
-                        if 'ln_1.bias' in key:
-                            new_key = key.replace('ln_1.bias', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_bias')
-                        if 'attn.in_proj_weight' in key:
-                            new_key = key.replace('attn.in_proj_weight', 'attn_with_input_layernorm.layernorm_qkv.weight')
-                        if 'attn.in_proj_bias' in key:
-                            new_key =  key.replace('attn.in_proj_bias', 'attn_with_input_layernorm.layernorm_qkv.bias')
-                        if 'attn.out_proj.weight' in key:
-                            new_key = key.replace('attn.out_proj.weight', 'attn_with_input_layernorm.proj.weight')
-                        if 'attn.out_proj.bias' in key:
-                            new_key =  key.replace('attn.out_proj.bias', 'attn_with_input_layernorm.proj.bias')
-                        if 'ln_2.weight' in key:
-                            new_key = key.replace('ln_2.weight', 'mlp.c_fc.layer_norm_weight')
-                        if 'ln_2.bias' in key:
-                            new_key = key.replace('ln_2.bias', 'mlp.c_fc.layer_norm_bias')
-                    else:
-                        if 'ln_1.weight' in key:
-                            new_key = key.replace('ln_1.weight', 'tf_layer.self_attention.layernorm_qkv.layer_norm_weight')
-                        if 'ln_1.bias' in key:
-                            new_key = key.replace('ln_1.bias', 'tf_layer.self_attention.layernorm_qkv.layer_norm_bias')
-                        if 'attn.in_proj_weight' in key:
-                            new_key = key.replace('attn.in_proj_weight', 'tf_layer.self_attention.layernorm_qkv.weight')
-                        if 'attn.in_proj_bias' in key:
-                            new_key =  key.replace('attn.in_proj_bias', 'tf_layer.self_attention.layernorm_qkv.bias')
-                        if 'attn.out_proj.weight' in key:
-                            new_key = key.replace('attn.out_proj.weight', 'tf_layer.self_attention.proj.weight')
-                        if 'attn.out_proj.bias' in key:
-                            new_key =  key.replace('attn.out_proj.bias', 'tf_layer.self_attention.proj.bias')
-                        if 'ln_2.weight' in key:
-                            new_key = key.replace('ln_2.weight', 'tf_layer.layernorm_mlp.layer_norm_weight')
-                        if 'ln_2.bias' in key:
-                            new_key = key.replace('ln_2.bias', 'tf_layer.layernorm_mlp.layer_norm_bias')
+                    if USE_NVTE_TF_LAYER:
+                        mha_prefix = 'tf_layer.self_attention'
+                        ln2_prefix = 'tf_layer.layernorm_mlp'
                         if 'mlp.c_fc.weight' in key:
                             new_key = key.replace('mlp.c_fc.weight', 'tf_layer.layernorm_mlp.fc1_weight')
                         if 'mlp.c_fc.bias' in key:
@@ -3410,6 +3379,29 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                             new_key = key.replace('mlp.c_proj.weight', 'tf_layer.layernorm_mlp.fc2_weight')
                         if 'mlp.c_proj.bias' in key:
                             new_key = key.replace('mlp.c_proj.bias', 'tf_layer.layernorm_mlp.fc2_bias')
+                    else:
+                        mha_prefix = 'attn_with_input_layernorm'
+                        ln2_prefix = 'mlp.layernorm_linear'
+                        if 'mlp.c_fc.weight' in key:
+                            new_key = key.replace('mlp.c_fc.weight', 'mlp.layernorm_linear.weight')
+                        if 'mlp.c_fc.bias' in key:
+                            new_key = key.replace('mlp.c_fc.bias', f'mlp.layernorm_linear.bias')
+                    if 'ln_1.weight' in key:
+                        new_key = key.replace('ln_1.weight', f'{mha_prefix}.layernorm_qkv.layer_norm_weight')
+                    if 'ln_1.bias' in key:
+                        new_key = key.replace('ln_1.bias', f'{mha_prefix}.layernorm_qkv.layer_norm_bias')
+                    if 'attn.in_proj_weight' in key:
+                        new_key = key.replace('attn.in_proj_weight', f'{mha_prefix}.layernorm_qkv.weight')
+                    if 'attn.in_proj_bias' in key:
+                        new_key =  key.replace('attn.in_proj_bias', f'{mha_prefix}.layernorm_qkv.bias')
+                    if 'attn.out_proj.weight' in key:
+                        new_key = key.replace('attn.out_proj.weight', f'{mha_prefix}.proj.weight')
+                    if 'attn.out_proj.bias' in key:
+                        new_key =  key.replace('attn.out_proj.bias', f'{mha_prefix}.proj.bias')
+                    if 'ln_2.weight' in key:
+                        new_key = key.replace('ln_2.weight', f'{ln2_prefix}.layer_norm_weight')
+                    if 'ln_2.bias' in key:
+                        new_key = key.replace('ln_2.bias', f'{ln2_prefix}.layer_norm_bias')
                     if new_key:
                         old_keys.append(key)
                         new_keys.append(new_key)
@@ -3419,7 +3411,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                         loaded_keys.remove(old_key)
                         loaded_keys.append(new_key)
             if USE_NVTE_RESIDUAL_ATTN:
-                remap_keys_te()
+                remap_keys_res_te()
+
         original_loaded_keys = loaded_keys
         loaded_keys = [_fix_key(key) for key in loaded_keys]
 
