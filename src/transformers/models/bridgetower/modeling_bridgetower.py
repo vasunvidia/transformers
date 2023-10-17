@@ -733,7 +733,8 @@ class BridgeTowerSelfAttention_NVTE(nn.Module):
             )
 
         self.attn_type=attn_type
-
+        self.packed_in = True if layer_num > 1 else False
+        self.packed_out = True if layer_num < config.num_hidden_layers else False
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -785,7 +786,9 @@ class BridgeTowerSelfAttention_NVTE(nn.Module):
             query_layer,
             key_layer,
             value_layer,
-            attention_mask=attn_mask_pick
+            attention_mask=attn_mask_pick,
+            packed_input=self.packed_in,
+            packed_out=self.packed_out
         )
         
         return (context_layer,)
