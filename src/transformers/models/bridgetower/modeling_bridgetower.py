@@ -27,7 +27,7 @@ from torch.nn import CrossEntropyLoss
 
 import transformer_engine.pytorch as te
 
-from ...activations import ACT2FN, QuickGELUActivation
+from ...activations import ACT2FN, QuickGELUActivation, GELUActivation
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,
@@ -40,7 +40,6 @@ from ...pytorch_utils import find_pruneable_heads_and_indices, prune_linear_laye
 from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_bridgetower import BridgeTowerConfig, BridgeTowerTextConfig, BridgeTowerVisionConfig
 
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BridgeTowerConfig"
@@ -52,7 +51,6 @@ BRIDGETOWER_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "BridgeTower/bridgetower-base-itm-mlm"
     # See all bridgetower models at https://huggingface.co/BridgeTower
 ]
-
 
 BRIDGETOWER_START_DOCSTRING = r"""
     This model is a PyTorch `torch.nn.Module <https://pytorch.org/docs/stable/nn.html#torch.nn.Module>`_ subclass. Use
@@ -129,6 +127,8 @@ USE_NVTE_ALL=bool(os.getenv('USE_NVTE_ALL'))
 
 # TE integration flags per layer (superceded by global flag)
 USE_NVTE_RESIDUAL_ATTN=bool(os.getenv('USE_NVTE_RESIDUAL_ATTN')) or USE_NVTE_ALL
+USE_NVTE_TEXT_LAYER=bool(os.getenv('USE_NVTE_TEXT_LAYER')) or USE_NVTE_ALL
+USE_NVTE_CROSS_LAYER=bool(os.getenv('USE_NVTE_CROSS_LAYER')) or USE_NVTE_ALL
 USE_NVTE_TF_LAYER=bool(os.getenv('USE_NVTE_TF_LAYER')) if USE_NVTE_RESIDUAL_ATTN else False
 USE_NVTE_SELF_ATTN=bool(os.getenv('USE_NVTE_SELF_ATTN')) or USE_NVTE_ALL
 USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
@@ -532,6 +532,24 @@ class BridgeTowerSelfOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
+class BridgeTowerSelfOutput_NVTE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        if USE_NVTE_LINEAR:
+            self.dense = te.Linear(
+                config.hidden_size,
+                config.hidden_size,
+                init_method=te.utils.init_method_normal(0.05*config.initializer_factor)
+            )
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = hidden_states + input_tensor
+        return hidden_states
 
 # Copied from transformers.models.bert.modeling_bert.BertIntermediate with Bert->BridgeTower
 class BridgeTowerIntermediate(nn.Module):
@@ -858,10 +876,13 @@ class BridgeTowerSelfAttention(SELF_ATTN_PARENT, nn.Module):
 
 # Copied from transformers.models.bert.modeling_bert.BertAttention with Bert->BridgeTower
 class BridgeTowerAttention_Original(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, position_embedding_type=None, add_ln=True):
         super().__init__()
         self.self = BridgeTowerSelfAttention(config, position_embedding_type=position_embedding_type)
-        self.output = BridgeTowerSelfOutput(config)
+        if add_ln:
+            self.output = BridgeTowerSelfOutput(config)
+        else:
+            self.output = BridgeTowerSelfOutput_NVTE(config)
         self.pruned_heads = set()
         
     def nvte_prune_linear_layer(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) -> nn.Module:
@@ -931,57 +952,30 @@ class BridgeTowerAttention_Original(nn.Module):
 
 
 class BridgeTowerAttention_NVTE(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, position_embedding_type=None, add_ln=True, cross_attn=False):
         super().__init__()
         # NOTE: te.MultiheadAttention is almost equivalent to BridgeTowerSelfAttention, but
         #       it needs a separate past key/value state concatenation at the end.
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
+        self.cross_attn = cross_attn
+        self.add_ln = add_ln
         self.qkv_plus_self_attn = te.MultiheadAttention(
             config.hidden_size,
             config.num_attention_heads,
+            attn_mask_type="padding",
             qkv_format="bshd",
             input_layernorm=False,
             attention_dropout=config.attention_probs_dropout_prob,
-            attention_type="cross" if self.is_decoder and self.add_cross_attention else "self",
+            attention_type="cross" if self.cross_attn else "self",
             init_method=te.utils.init_method_normal(0.05*config.initializer_factor),
             output_layer_init_method=te.utils.init_method_normal(0.05*config.initializer_factor),
-            
+            qkv_weight_interleaved=False,
         )
         self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.output_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if add_ln:
+            self.output_layernorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pruned_heads = set()
-        
-        @torch.no_grad()
-        def nvte_load_states_self_attn(module, state_dict, prefix, local_metadata, strict,
-                                       missing_keys, unexpected_keys, error_msgs):
-            for key in state_dict.keys():
-                input_param = state_dict[key]
-                # pre-matmul QKV weight/bias
-                if key == prefix + "self.query.weight":
-                    module.qkv_plus_self_attn.qkv.query_weight.copy_(input_param)
-                elif key == prefix + "self.query.bias":
-                    module.qkv_plus_self_attn.qkv.query_bias.copy_(input_param)
-                elif key == prefix + "self.key.weight":
-                    module.qkv_plus_self_attn.qkv.key_weight.copy_(input_param)
-                elif key == prefix + "self.key.bias":
-                    module.qkv_plus_self_attn.qkv.key_bias.copy_(input_param)
-                elif key == prefix + "self.value.weight":
-                    module.qkv_plus_self_attn.qkv.value_weight.copy_(input_param)
-                elif key == prefix + "self.value.bias":
-                    module.qkv_plus_self_attn.qkv.value_bias.copy_(input_param)
-                # post-matmul QKV projection weight/bias
-                elif key == prefix + "output.dense.weight":
-                    module.qkv_plus_self_attn.proj.weight.copy_(input_param)
-                elif key == prefix + "output.dense.bias":
-                    module.qkv_plus_self_attn.proj.bias.copy_(input_param)
-                # output layernorm weight/bias
-                elif key == prefix + "output.LayerNorm.weight":
-                    module.output_layernorm.weight.copy_(input_param)
-                elif key == prefix + "output.LayerNorm.bias":
-                    module.output_layernorm.bias.copy_(input_param)
-                    
-        self._register_load_state_dict_pre_hook(nvte_load_states_self_attn, with_module=True)
 
     def prune_heads(self, heads):
         pass
@@ -995,22 +989,32 @@ class BridgeTowerAttention_NVTE(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,  # NOTE: This is never used so we ignore it
+        attn_mask_type: Optional[str] = "padding",
     ) -> Tuple[torch.Tensor]:
         # te.MultiheadAttention
-        attn_mask_pick = encoder_attention_mask if encoder_hidden_states is not None and self.is_decoder else attention_mask
+        is_cross_attention = encoder_hidden_states is not None
+        if is_cross_attention:
+            assert self.cross_attn
+            attn_mask_pick = encoder_attention_mask
+        else:
+            attn_mask_pick = attention_mask
+        attn_mask_pick_bool = attn_mask_pick.ne(0).tile((1,1,attention_mask.size(3),1))
         self_outputs = self.qkv_plus_self_attn(
             hidden_states,
-            attention_mask=attn_mask_pick,
-            encoder_output=encoder_hidden_states
+            attention_mask=attn_mask_pick_bool,
+            encoder_output=encoder_hidden_states,
+            attn_mask_type=attn_mask_type,
         )
         # original implementation always outputs a tuple out of the multihead attention code
         self_outputs = (self_outputs,)
 
         # concat with past key/value states (this would normally be in BridgeTowerSelfAttention)
-        if self.is_decoder:
+        if is_cross_attention:
             self_outputs = self_outputs + (past_key_value,)
 
-        attention_output = self.output_layernorm(self.output_dropout(self_outputs[0]) + hidden_states)
+        attention_output = self.output_dropout(self_outputs[0]) + hidden_states
+        if self.add_ln:
+            attention_output = self.output_layernorm(attention_output)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
@@ -1022,7 +1026,7 @@ class BridgeTowerAttention(ATTENTION_PARENT, nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-class BridgeTowerBertCrossLayer(nn.Module):
+class BridgeTowerBertCrossLayer_Original(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
@@ -1043,6 +1047,7 @@ class BridgeTowerBertCrossLayer(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        layer_type="",
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attention_outputs = self.attention(
@@ -1083,8 +1088,89 @@ class BridgeTowerBertCrossLayer(nn.Module):
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output
 
+class BridgeTowerBertCrossLayer_NVTE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward
+        self.seq_len_dim = 1
+        self.attention = BridgeTowerAttention_NVTE(config)
+        self.is_decoder = config.is_decoder
+        self.add_cross_attention = config.add_cross_attention
+        self.crossattention = BridgeTowerAttention_NVTE(config, add_ln=False, cross_attn=True)
+        if isinstance(config.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.intermediate_act_fn = config.hidden_act
+        self.mlp = nn.ModuleDict(
+            OrderedDict(
+                [
+                    ("c_fc", te.LayerNormLinear(config.hidden_size, config.hidden_size * 4, config.layer_norm_eps, return_layernorm_output=True)),
+                    ("gelu", self.intermediate_act_fn),
+                    ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size)),
+                ]
+            )
+        )
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.LayerNorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        #self.intermediate = BridgeTowerIntermediate(config)
+        #self.output = BridgeTowerOutput(config)
 
-class BridgeTowerTextLayer(nn.Module):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_attention_mask=None,
+        past_key_value=None,
+        output_attentions=False,
+        layer_type="",
+    ):
+        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        self_attention_outputs = self.attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            head_mask=None,
+            output_attentions=output_attentions,
+            past_key_value=None,
+            attn_mask_type="no_mask" if layer_type=="image" else "padding",
+        )
+        attention_output = self_attention_outputs[0]
+
+        # if decoder, the last output is tuple of self-attn cache
+        # add self attentions if we output attention weights
+        outputs = self_attention_outputs[1:]
+
+        cross_attention_outputs = self.crossattention(
+            attention_output,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            attn_mask_type="no_mask" if layer_type=="text" else "padding",
+        )
+        attention_output = cross_attention_outputs[0]
+        intermediate_output, attention_output = self.mlp['c_fc'](cross_attention_outputs[0])
+        intermediate_output = self.mlp['gelu'](intermediate_output)
+        intermediate_output = self.mlp['c_proj'](intermediate_output)
+        layer_output = self.LayerNorm(self.output_dropout(intermediate_output) + attention_output)
+        #layer_output = self.output(intermediate_output, attention_output)
+        # add cross attentions if we output attention weights
+        outputs = outputs + cross_attention_outputs[1:-1]
+        outputs = (layer_output,) + outputs
+
+        return outputs
+
+CROSS_LAYER_PARENT=BridgeTowerBertCrossLayer_Original
+if USE_NVTE_ALL or USE_NVTE_CROSS_LAYER:
+    CROSS_LAYER_PARENT=BridgeTowerBertCrossLayer_NVTE
+class BridgeTowerBertCrossLayer(CROSS_LAYER_PARENT, nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+class BridgeTowerTextLayer_Original(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
@@ -1169,6 +1255,93 @@ class BridgeTowerTextLayer(nn.Module):
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output
 
+class BridgeTowerTextLayer_NVTE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.attention = nn.ModuleDict(
+            OrderedDict(
+                [
+                    ("q_layer", nn.Linear(config.hidden_size, self.all_head_size)),
+                    ("k_layer", nn.Linear(config.hidden_size, self.all_head_size)),
+                    ("v_layer", nn.Linear(config.hidden_size, self.all_head_size)),
+                    ("core_attention", te.DotProductAttention(self.num_attention_heads,
+                            self.attention_head_size,
+                            num_gqa_groups=self.num_attention_heads,
+                            attention_type="self",
+                            attention_dropout=config.attention_probs_dropout_prob,
+                            qkv_format="bshd",
+                            tp_size=1,
+                            get_rng_state_tracker=None,
+                            sequence_parallel=False,
+                            tp_group=None,
+                        )),
+                ]
+            )
+        )
+        self.attn_output = BridgeTowerSelfOutput(config)
+        if isinstance(config.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.intermediate_act_fn = config.hidden_act
+        self.mlp = nn.ModuleDict(
+            OrderedDict(
+                [
+                    ("c_fc", nn.Linear(config.hidden_size, config.hidden_size * 4)),
+                    ("gelu", self.intermediate_act_fn),
+                    ("c_proj", nn.Linear(config.hidden_size * 4, config.hidden_size)),
+                ]
+            )
+        )
+        self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.LayerNorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
+
+        query_layer = self.attention['q_layer'](hidden_states)
+        key_layer = self.attention['k_layer'](hidden_states)
+        value_layer = self.attention['v_layer'](hidden_states)
+
+        query_layer = query_layer.view(query_layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+        key_layer = key_layer.view(key_layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+        value_layer = value_layer.view(value_layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
+        context_layer = self.attention['core_attention'](
+            query_layer,
+            key_layer,
+            value_layer,
+            qkv_format="bshd",
+            attention_mask=attention_mask.ne(0),
+            attn_mask_type="padding",
+        )
+
+        attention_output = self.attn_output(context_layer, hidden_states)
+        intermediate_output = self.mlp['c_fc'](attention_output)
+        intermediate_output = self.mlp['gelu'](intermediate_output)
+        intermediate_output = self.mlp['c_proj'](intermediate_output)
+        layer_output = self.LayerNorm(self.output_dropout(intermediate_output) + attention_output)
+        outputs = (layer_output,)
+
+        return outputs
+
+TEXT_LAYER_PARENT=BridgeTowerTextLayer_Original
+if USE_NVTE_ALL or USE_NVTE_TEXT_LAYER:
+    TEXT_LAYER_PARENT=BridgeTowerTextLayer_NVTE
+class BridgeTowerTextLayer(TEXT_LAYER_PARENT, nn.Module):
+    def __init__(self, config):
+        super().__init__(config)
 
 # Copied from transformers.models.roberta.modeling_roberta.RobertaEncoder with Roberta->BridgeTowerText
 class BridgeTowerTextEncoder(nn.Module):
@@ -1873,6 +2046,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             attention_mask=extend_text_masks,
             encoder_attention_mask=extend_image_masks,
             output_attentions=output_attentions,
+            layer_type="text",
         )
         cross_text_features = layer_outputs_text[0]
 
@@ -1882,6 +2056,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             attention_mask=extend_image_masks,
             encoder_attention_mask=extend_text_masks,
             output_attentions=output_attentions,
+            layer_type="image",
         )
         cross_image_features = layer_outputs_image[0]
 
@@ -1932,6 +2107,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 attention_mask=extend_text_masks,
                 encoder_attention_mask=extend_image_masks,
                 output_attentions=output_attentions,
+                layer_type="text",
             )
             cross_text_features = layer_outputs_text[0]
 
@@ -1941,6 +2117,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 attention_mask=extend_image_masks,
                 encoder_attention_mask=extend_text_masks,
                 output_attentions=output_attentions,
+                layer_type="image",
             )
             cross_image_features = layer_outputs_image[0]
 

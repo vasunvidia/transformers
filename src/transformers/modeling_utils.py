@@ -3361,6 +3361,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             USE_NVTE_ALL = bool(os.getenv('USE_NVTE_ALL',''))
             # TE integration flags per layer (superceded by global flag)
             USE_NVTE_RESIDUAL_ATTN = bool(os.getenv('USE_NVTE_RESIDUAL_ATTN','')) or USE_NVTE_ALL
+            USE_NVTE_TEXT_LAYER = bool(os.getenv('USE_NVTE_TEXT_LAYER','')) or USE_NVTE_ALL
+            USE_NVTE_CROSS_LAYER = bool(os.getenv('USE_NVTE_CROSS_LAYER','')) or USE_NVTE_ALL
             USE_NVTE_TF_LAYER = bool(os.getenv('USE_NVTE_TF_LAYER', '')) or USE_NVTE_ALL
             def remap_keys_te():
                 old_keys = []
@@ -3368,48 +3370,137 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 for key in state_dict.keys():
                     new_key = None
                     key = _fix_key(key)
-                    if not (USE_NVTE_TF_LAYER):
-                        if 'ln_1.weight' in key:
-                            new_key = key.replace('ln_1.weight', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_weight')
-                        if 'ln_1.bias' in key:
-                            new_key = key.replace('ln_1.bias', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_bias')
-                        if 'attn.in_proj_weight' in key:
-                            new_key = key.replace('attn.in_proj_weight', 'attn_with_input_layernorm.layernorm_qkv.weight')
-                        if 'attn.in_proj_bias' in key:
-                            new_key =  key.replace('attn.in_proj_bias', 'attn_with_input_layernorm.layernorm_qkv.bias')
-                        if 'attn.out_proj.weight' in key:
-                            new_key = key.replace('attn.out_proj.weight', 'attn_with_input_layernorm.proj.weight')
-                        if 'attn.out_proj.bias' in key:
-                            new_key =  key.replace('attn.out_proj.bias', 'attn_with_input_layernorm.proj.bias')
-                        if 'ln_2.weight' in key:
-                            new_key = key.replace('ln_2.weight', 'mlp.c_fc.layer_norm_weight')
-                        if 'ln_2.bias' in key:
-                            new_key = key.replace('ln_2.bias', 'mlp.c_fc.layer_norm_bias')
-                    else:
-                        if 'ln_1.weight' in key:
-                            new_key = key.replace('ln_1.weight', 'tf_layer.self_attention.layernorm_qkv.layer_norm_weight')
-                        if 'ln_1.bias' in key:
-                            new_key = key.replace('ln_1.bias', 'tf_layer.self_attention.layernorm_qkv.layer_norm_bias')
-                        if 'attn.in_proj_weight' in key:
-                            new_key = key.replace('attn.in_proj_weight', 'tf_layer.self_attention.layernorm_qkv.weight')
-                        if 'attn.in_proj_bias' in key:
-                            new_key =  key.replace('attn.in_proj_bias', 'tf_layer.self_attention.layernorm_qkv.bias')
-                        if 'attn.out_proj.weight' in key:
-                            new_key = key.replace('attn.out_proj.weight', 'tf_layer.self_attention.proj.weight')
-                        if 'attn.out_proj.bias' in key:
-                            new_key =  key.replace('attn.out_proj.bias', 'tf_layer.self_attention.proj.bias')
-                        if 'ln_2.weight' in key:
-                            new_key = key.replace('ln_2.weight', 'tf_layer.layernorm_mlp.layer_norm_weight')
-                        if 'ln_2.bias' in key:
-                            new_key = key.replace('ln_2.bias', 'tf_layer.layernorm_mlp.layer_norm_bias')
-                        if 'mlp.c_fc.weight' in key:
-                            new_key = key.replace('mlp.c_fc.weight', 'tf_layer.layernorm_mlp.fc1_weight')
-                        if 'mlp.c_fc.bias' in key:
-                            new_key = key.replace('mlp.c_fc.bias', 'tf_layer.layernorm_mlp.fc1_bias')
-                        if 'mlp.c_proj.weight' in key:
-                            new_key = key.replace('mlp.c_proj.weight', 'tf_layer.layernorm_mlp.fc2_weight')
-                        if 'mlp.c_proj.bias' in key:
-                            new_key = key.replace('mlp.c_proj.bias', 'tf_layer.layernorm_mlp.fc2_bias')
+                    if USE_NVTE_RESIDUAL_ATTN and 'vision_model.visual.transformer.resblocks' in key:
+                        if not USE_NVTE_TF_LAYER:
+                            if 'ln_1.weight' in key:
+                                new_key = key.replace('ln_1.weight', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_weight')
+                            if 'ln_1.bias' in key:
+                                new_key = key.replace('ln_1.bias', 'attn_with_input_layernorm.layernorm_qkv.layer_norm_bias')
+                            if 'attn.in_proj_weight' in key:
+                                new_key = key.replace('attn.in_proj_weight', 'attn_with_input_layernorm.layernorm_qkv.weight')
+                            if 'attn.in_proj_bias' in key:
+                                new_key =  key.replace('attn.in_proj_bias', 'attn_with_input_layernorm.layernorm_qkv.bias')
+                            if 'attn.out_proj.weight' in key:
+                                new_key = key.replace('attn.out_proj.weight', 'attn_with_input_layernorm.proj.weight')
+                            if 'attn.out_proj.bias' in key:
+                                new_key =  key.replace('attn.out_proj.bias', 'attn_with_input_layernorm.proj.bias')
+                            if 'ln_2.weight' in key:
+                                new_key = key.replace('ln_2.weight', 'mlp.c_fc.layer_norm_weight')
+                            if 'ln_2.bias' in key:
+                                new_key = key.replace('ln_2.bias', 'mlp.c_fc.layer_norm_bias')
+                        else:
+                            if 'ln_1.weight' in key:
+                                new_key = key.replace('ln_1.weight', 'tf_layer.self_attention.layernorm_qkv.layer_norm_weight')
+                            if 'ln_1.bias' in key:
+                                new_key = key.replace('ln_1.bias', 'tf_layer.self_attention.layernorm_qkv.layer_norm_bias')
+                            if 'attn.in_proj_weight' in key:
+                                new_key = key.replace('attn.in_proj_weight', 'tf_layer.self_attention.layernorm_qkv.weight')
+                            if 'attn.in_proj_bias' in key:
+                                new_key =  key.replace('attn.in_proj_bias', 'tf_layer.self_attention.layernorm_qkv.bias')
+                            if 'attn.out_proj.weight' in key:
+                                new_key = key.replace('attn.out_proj.weight', 'tf_layer.self_attention.proj.weight')
+                            if 'attn.out_proj.bias' in key:
+                                new_key =  key.replace('attn.out_proj.bias', 'tf_layer.self_attention.proj.bias')
+                            if 'ln_2.weight' in key:
+                                new_key = key.replace('ln_2.weight', 'tf_layer.layernorm_mlp.layer_norm_weight')
+                            if 'ln_2.bias' in key:
+                                new_key = key.replace('ln_2.bias', 'tf_layer.layernorm_mlp.layer_norm_bias')
+                            if 'mlp.c_fc.weight' in key:
+                                new_key = key.replace('mlp.c_fc.weight', 'tf_layer.layernorm_mlp.fc1_weight')
+                            if 'mlp.c_fc.bias' in key:
+                                new_key = key.replace('mlp.c_fc.bias', 'tf_layer.layernorm_mlp.fc1_bias')
+                            if 'mlp.c_proj.weight' in key:
+                                new_key = key.replace('mlp.c_proj.weight', 'tf_layer.layernorm_mlp.fc2_weight')
+                            if 'mlp.c_proj.bias' in key:
+                                new_key = key.replace('mlp.c_proj.bias', 'tf_layer.layernorm_mlp.fc2_bias')
+                    elif USE_NVTE_TEXT_LAYER and 'text_model.encoder.layer' in key:
+                        if 'attention.self.query.weight' in key:
+                            new_key = key.replace('attention.self.query.weight', 'attention.q_layer.weight')
+                        if 'attention.self.query.bias' in key:
+                            new_key = key.replace('attention.self.query.bias', 'attention.q_layer.bias')
+                        if 'attention.self.key.weight' in key:
+                            new_key = key.replace('attention.self.key.weight', 'attention.k_layer.weight')
+                        if 'attention.self.key.bias' in key:
+                            new_key = key.replace('attention.self.key.bias', 'attention.k_layer.bias')
+                        if 'attention.self.value.weight' in key:
+                            new_key = key.replace('attention.self.value.weight', 'attention.v_layer.weight')
+                        if 'attention.self.value.bias' in key:
+                            new_key = key.replace('attention.self.value.bias', 'attention.v_layer.bias')
+                        if 'attention.output.dense.weight' in key:
+                            new_key = key.replace('attention.output.dense.weight', 'attn_output.dense.weight')
+                        if 'attention.output.dense.bias' in key:
+                            new_key = key.replace('attention.output.dense.bias', 'attn_output.dense.bias')
+                        if 'attention.output.LayerNorm.weight' in key:
+                            new_key = key.replace('attention.output.LayerNorm.weight', 'attn_output.LayerNorm.weight')
+                        if 'attention.output.LayerNorm.bias' in key:
+                            new_key = key.replace('attention.output.LayerNorm.bias', 'attn_output.LayerNorm.bias')
+
+                        if 'intermediate.dense.weight' in key:
+                            new_key = key.replace('intermediate.dense.weight', 'mlp.c_fc.weight')
+                        if 'intermediate.dense.bias' in key:
+                            new_key = key.replace('intermediate.dense.bias', 'mlp.c_fc.bias')
+                        if 'output.dense.weight' in key and 'attention' not in key:
+                            new_key = key.replace('output.dense.weight', 'mlp.c_proj.weight')
+                        if 'output.dense.bias' in key and 'attention' not in key:
+                            new_key = key.replace('output.dense.bias', 'mlp.c_proj.bias')
+                        if 'output.LayerNorm.weight' in key and 'attention' not in key:
+                            new_key = key.replace('output.LayerNorm.weight', 'LayerNorm.weight')
+                        if 'output.LayerNorm.bias' in key and 'attention' not in key:
+                            new_key = key.replace('output.LayerNorm.bias', 'LayerNorm.bias')
+                    elif USE_NVTE_CROSS_LAYER and ('cross_modal_image_layers' in key or 'cross_modal_text_layers' in key):
+                        if 'attention.self.query.weight' in key:
+                            new_key = key.replace('attention.self.query.weight', 'attention.qkv_plus_self_attn.qkv.query_weight')
+                        if 'attention.self.query.bias' in key:
+                            new_key = key.replace('attention.self.query.bias', 'attention.qkv_plus_self_attn.qkv.query_bias')
+                        if 'attention.self.key.weight' in key:
+                            new_key = key.replace('attention.self.key.weight', 'attention.qkv_plus_self_attn.qkv.key_weight')
+                        if 'attention.self.key.bias' in key:
+                            new_key = key.replace('attention.self.key.bias', 'attention.qkv_plus_self_attn.qkv.key_bias')
+                        if 'attention.self.value.weight' in key:
+                            new_key = key.replace('attention.self.value.weight', 'attention.qkv_plus_self_attn.qkv.value_weight')
+                        if 'attention.self.value.bias' in key:
+                            new_key = key.replace('attention.self.value.bias', 'attention.qkv_plus_self_attn.qkv.value_bias')
+                        if 'attention.output.dense.weight' in key:
+                            new_key = key.replace('attention.output.dense.weight', 'attention.qkv_plus_self_attn.proj.weight')
+                        if 'attention.output.dense.bias' in key:
+                            new_key = key.replace('attention.output.dense.bias', 'attention.qkv_plus_self_attn.proj.bias')
+                        if 'attention.output.LayerNorm.weight' in key:
+                            new_key = key.replace('attention.output.LayerNorm.weight', 'attention.output_layernorm.weight')
+                        if 'attention.output.LayerNorm.bias' in key:
+                            new_key = key.replace('attention.output.LayerNorm.bias', 'attention.output_layernorm.bias')
+
+                        if 'crossattention.self.query.weight' in key:
+                            new_key = key.replace('crossattention.self.query.weight', 'crossattention.qkv_plus_self_attn.query_layer.weight')
+                        if 'crossattention.self.query.bias' in key:
+                            new_key = key.replace('crossattention.self.query.bias', 'crossattention.qkv_plus_self_attn.query_layer.bias')
+                        if 'crossattention.self.key.weight' in key:
+                            new_key = key.replace('crossattention.self.key.weight', 'crossattention.qkv_plus_self_attn.key_value.key_weight')
+                        if 'crossattention.self.key.bias' in key:
+                            new_key = key.replace('crossattention.self.key.bias', 'crossattention.qkv_plus_self_attn.key_value.key_bias')
+                        if 'crossattention.self.value.weight' in key:
+                            new_key = key.replace('crossattention.self.value.weight', 'crossattention.qkv_plus_self_attn.key_value.value_weight')
+                        if 'crossattention.self.value.bias' in key:
+                            new_key = key.replace('crossattention.self.value.bias', 'crossattention.qkv_plus_self_attn.key_value.value_bias')
+                        if 'crossattention.output.dense.weight' in key:
+                            new_key = key.replace('crossattention.output.dense.weight', 'crossattention.qkv_plus_self_attn.proj.weight')
+                        if 'crossattention.output.dense.bias' in key:
+                            new_key = key.replace('crossattention.output.dense.bias', 'crossattention.qkv_plus_self_attn.proj.bias')
+                        if 'crossattention.output.LayerNorm.weight' in key:
+                            new_key = key.replace('crossattention.output.LayerNorm.weight', 'mlp.c_fc.layer_norm_weight')
+                        if 'crossattention.output.LayerNorm.bias' in key:
+                            new_key = key.replace('crossattention.output.LayerNorm.bias', 'mlp.c_fc.layer_norm_bias')
+                        if 'intermediate.dense.weight' in key:
+                            new_key = key.replace('intermediate.dense.weight', 'mlp.c_fc.weight')
+                        if 'intermediate.dense.bias' in key:
+                            new_key = key.replace('intermediate.dense.bias', 'mlp.c_fc.bias')
+                        if 'output.dense.weight' in key and 'attention' not in key:
+                            new_key = key.replace('output.dense.weight', 'mlp.c_proj.weight')
+                        if 'output.dense.bias' in key and 'attention' not in key:
+                            new_key = key.replace('output.dense.bias', 'mlp.c_proj.bias')
+                        if 'output.LayerNorm.weight' in key and 'attention' not in key:
+                            new_key = key.replace('output.LayerNorm.weight', 'LayerNorm.weight')
+                        if 'output.LayerNorm.bias' in key and 'attention' not in key:
+                            new_key = key.replace('output.LayerNorm.bias', 'LayerNorm.bias')
                     if new_key:
                         old_keys.append(key)
                         new_keys.append(new_key)
@@ -3418,7 +3509,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                     if old_key in loaded_keys:
                         loaded_keys.remove(old_key)
                         loaded_keys.append(new_key)
-            if USE_NVTE_RESIDUAL_ATTN:
+            if USE_NVTE_RESIDUAL_ATTN or USE_NVTE_TEXT_LAYER or USE_NVTE_CROSS_LAYER:
                 remap_keys_te()
         original_loaded_keys = loaded_keys
         loaded_keys = [_fix_key(key) for key in loaded_keys]
