@@ -323,6 +323,8 @@ class TrainingArguments:
         fp16_opt_level (`str`, *optional*, defaults to 'O1'):
             For `fp16` training, Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']. See details on
             the [Apex documentation](https://nvidia.github.io/apex/amp).
+        use_master_weights_bf16 (`bool`, *optional*, defaults to `False`):
+            Whether to use bf16 model weights and enable fp32 master weights in FusedAdam optimizer.
         fp16_backend (`str`, *optional*, defaults to `"auto"`):
             This argument is deprecated. Use `half_precision_backend` instead.
         half_precision_backend (`str`, *optional*, defaults to `"auto"`):
@@ -868,6 +870,14 @@ class TrainingArguments:
             "help": (
                 "For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']. "
                 "See details at https://nvidia.github.io/apex/amp.html"
+            )
+        },
+    )
+    use_master_weights_bf16: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use bf16 model weights and enable fp32 master weights in FusedAdam optimizer."
             )
         },
     )

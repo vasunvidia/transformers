@@ -315,6 +315,7 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
             self.attn_with_input_layernorm = te.MultiheadAttention(
                 config.hidden_size,
                 config.hidden_size // 64,
+                qkv_format="bshd",
                 attention_dropout=0.0,
                 attn_mask_type="no_mask",
                 fuse_qkv_params=True,
@@ -467,11 +468,15 @@ class BridgeTowerVisionTransformer(nn.Module):
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.ln_pre(hidden_states)
         # NLD -> LND
-        hidden_states = hidden_states.permute(1, 0, 2)
+        if not USE_NVTE_RESIDUAL_ATTN:
+            hidden_states = hidden_states.permute(1, 0, 2)
         return hidden_states
 
     def forward_post(self, hidden_state: torch.Tensor):
-        visual_output_post = hidden_state.permute(1, 0, 2)
+        if not USE_NVTE_RESIDUAL_ATTN:
+            visual_output_post = hidden_state.permute(1, 0, 2)
+        else:
+            visual_output_post = hidden_state
         visual_output_post = self.ln_post(visual_output_post)
         return visual_output_post
 
@@ -1920,6 +1925,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
 
         if output_hidden_states:
             all_hidden_states_image += (image_embeds,)
+
 
         if not self.overlap_text_vision_layers:
             # Run the first 'split_index' layers of the textual encoder

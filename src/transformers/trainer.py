@@ -654,6 +654,10 @@ class Trainer:
                         " https://www.github.com/nvidia/apex."
                     )
                 self.use_apex = True
+        self.use_master_weights_bf16 = False
+        if args.bf16 and args.use_master_weights_bf16 and args.optim == OptimizerNames.ADAMW_APEX_FUSED:
+            print (f'use_master_weights_bf16 true')
+            self.use_master_weights_bf16 = True
 
         # FP16 + model parallelism in SageMaker: gradient clipping does not work for now so we raise a helpful error.
         if (
@@ -1076,6 +1080,9 @@ class Trainer:
                 from apex.optimizers import FusedAdam
 
                 optimizer_cls = FusedAdam
+                if args.bf16 and args.use_master_weights_bf16 and args.optim == OptimizerNames.ADAMW_APEX_FUSED:
+                    adam_kwargs['master_weights'] = True
+                    adam_kwargs['capturable'] = True
                 optimizer_kwargs.update(adam_kwargs)
             except ImportError:
                 raise ValueError("Trainer tried to instantiate apex FusedAdam but apex is not installed!")
@@ -1373,6 +1380,8 @@ class Trainer:
         # Mixed precision training with apex (torch < 1.6)
         if self.use_apex and training:
             model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
+        if self.use_master_weights_bf16:
+            model.to(torch.bfloat16)
 
         # Multi-gpu training (should be after apex fp16 initialization) / 8bit models does not support DDP
         if self.args.n_gpu > 1 and not getattr(model, "is_loaded_in_8bit", False):
@@ -3189,7 +3198,6 @@ class Trainer:
                 if self.is_deepspeed_enabled
                 else self.accelerator.prepare_model(model, evaluation_mode=True)
             )
-
             if self.is_fsdp_enabled:
                 self.model = model
 
