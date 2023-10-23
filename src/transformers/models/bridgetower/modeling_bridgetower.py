@@ -1275,6 +1275,8 @@ class BridgeTowerTextLayer_NVTE(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor]:
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -1290,9 +1292,11 @@ class BridgeTowerTextLayer_NVTE(nn.Module):
             query_layer,
             key_layer,
             value_layer,
-            qkv_format="bshd",
             attention_mask=attention_mask.ne(0),
-            attn_mask_type="padding",
+            attn_mask_type="padding" if cu_seqlens is None else "no_mask",
+            cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=seq_len, max_seqlen_kv=seq_len,
+            qkv_format="bshd" if cu_seqlens is None else "thd",
         )
 
         attention_output = self.attn_output(context_layer, hidden_states)
@@ -1408,6 +1412,45 @@ class BridgeTowerTextEncoder(nn.Module):
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
         )
+
+    def forward_pre(self, text_embed: torch.Tensor, extend_text_masks: torch.Tensor):
+        hidden_states = text_embed
+        bs = extend_text_masks.size(0)
+        seq_len = hidden_states.size(1)
+        total_tokens = bs * seq_len
+        if USE_NVTE_TEXT_LAYER:
+            mask = extend_text_masks.eq(0).squeeze(1).squeeze(1)
+            reduced_mask = mask.sum(dim=1)
+            cu_seqlens = torch.zeros(bs+1, dtype=torch.int, device=text_embed.device)
+            cu_seqlens[1:] = reduced_mask.cumsum(dim=0)
+
+            mask = mask.reshape(-1)
+            indices = mask.nonzero()
+            num_nonzeros = indices.size(0)
+            pad_amount = total_tokens - num_nonzeros
+            indices = torch.nn.functional.pad(input=indices, pad=(0, 0, 0, pad_amount),
+                    mode="constant", value=float(bs * seq_len))
+            hidden_states = hidden_states.view(total_tokens, -1)
+            extra_row = torch.zeros(1, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+            hidden_states = torch.cat((hidden_states, extra_row), dim=0)
+
+            indices = indices.repeat(1, hidden_states.shape[1])
+            hidden_states = torch.gather(hidden_states, 0, indices)[:num_nonzeros,:]
+
+            return hidden_states, cu_seqlens, indices, pad_amount, seq_len
+        return hidden_states, None, None, None, hidden_states.size(1)
+
+    def forward_post(self, hidden_states: torch.Tensor, indices: torch.Tensor = None, padded_tokens: int = None, seq_len: int = None):
+        text_output_post = hidden_states
+        if seq_len is not None:
+            indices = indices[:hidden_states.size(0),:]
+            #print (f'forward_post hidden_states {hidden_states.shape} indices {indices.shape} padded_tokens {padded_tokens} seq_len {seq_len}')
+            assert padded_tokens is not None and hidden_states.dim() == 2 and indices is not None
+            text_output_post = torch.zeros(hidden_states.size(0)+padded_tokens+1, hidden_states.size(1), dtype=hidden_states.dtype, device=hidden_states.device)
+            text_output_post.scatter_(0, indices, hidden_states)
+            text_output_post = text_output_post[:-1, :]
+            text_output_post = text_output_post.view(-1, seq_len, hidden_states.size(1))
+        return text_output_post
 
 
 # Copied from transformers.models.roberta.modeling_roberta.RobertaEmbeddings with Roberta->BridgeTowerText
@@ -1929,6 +1972,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         extend_text_masks = self.text_model.get_extended_attention_mask(attention_mask, input_shape).to(
             input_ids.device
         )
+        text_embeds, cu_seqlens_text, indices, n_pad, seq_len_text = self.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
 
         # The split_index determines how many layers of the uni-modal encoder are applied before the cross-modal encoder
         split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
@@ -1946,10 +1990,10 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         if not self.overlap_text_vision_layers:
             # Run the first 'split_index' layers of the textual encoder
             for layer in self.text_model.encoder.layer[:split_index]:
-                text_embeds = layer(text_embeds, extend_text_masks)[0]
+                text_embeds = layer(text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
 
                 if output_hidden_states:
-                    all_hidden_states_text += (text_embeds,)
+                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
 
             # Run the first 'split_index' layers of the visual encoder
             for block in self.vision_model.visual.transformer.resblocks[:split_index]:
@@ -1968,12 +2012,12 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
 
                 self.text_model_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.text_model_stream):
-                    text_embeds = layer(text_embeds, extend_text_masks)[0]
+                    text_embeds = layer(text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
                 image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image)
                 torch.cuda.current_stream().wait_stream(self.text_model_stream)
 
                 if output_hidden_states:
-                    all_hidden_states_text += (text_embeds,)
+                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
                     if USE_NVTE_RESIDUAL_ATTN:
                         all_hidden_states_image += (image_embeds.view(-1, seq_len_image, image_embeds.size(1)),)
 #                        all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
@@ -1981,9 +2025,10 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                         all_hidden_states_image += (image_embeds,)
 
         image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype), seq_len_image)
+        #text_embeds = self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
 
         # first layer is a special case because we don't have the output from the cross-encoder yet
-        cross_modal_text = self.cross_modal_text_transform(text_embeds)
+        cross_modal_text = self.cross_modal_text_transform(self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text))
 
         text_token_type_embeddings = self.token_type_embeddings(
             torch.zeros(1, dtype=torch.long, device=input_ids.device)
@@ -2040,14 +2085,14 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         #  the cross-modal encoder via bridge layers, which brings bottom-up alignment and fusion to the cross-modal encoder.
         for i in range(split_index, len(self.text_model.encoder.layer)):
             if not self.overlap_text_vision_layers:
-                text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks)[0]
+                text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
                 image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image).type(
                     self.vision_model.dtype
                 )
             else:
                 self.text_model_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.text_model_stream):
-                    text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks)[0]
+                    text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
                 image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image).type(
                     self.vision_model.dtype
                 )
@@ -2062,7 +2107,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
 
             # Bridge layers for textual and visual encoders
             cross_text_features_ = text_link_tower(
-                self.cross_modal_text_transform(text_embeds) + text_token_type_embeddings,
+                self.cross_modal_text_transform(self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)) + text_token_type_embeddings,
                 cross_text_features,
                 extend_text_masks,
             )
@@ -2092,7 +2137,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             link_layer_index += 1
 
             if output_hidden_states:
-                all_hidden_states_text += (text_embeds,)
+                all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
                 if USE_NVTE_RESIDUAL_ATTN:
                     all_hidden_states_image += (image_embeds.view(-1, seq_len_image, image_embeds.size(1)),)
 #                    all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
