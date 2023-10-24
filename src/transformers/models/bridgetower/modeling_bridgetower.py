@@ -958,6 +958,11 @@ class BridgeTowerAttention_NVTE(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,  # NOTE: This is never used so we ignore it
         attn_mask_type: Optional[str] = "padding",
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_kv: Optional[int] = None,
+        qkv_format: Optional[str] = "bshd",
     ) -> Tuple[torch.Tensor]:
         # te.MultiheadAttention
         is_cross_attention = encoder_hidden_states is not None
@@ -972,6 +977,11 @@ class BridgeTowerAttention_NVTE(nn.Module):
             attention_mask=attn_mask_pick_bool,
             encoder_output=encoder_hidden_states,
             attn_mask_type=attn_mask_type,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            qkv_format=qkv_format,
         )
         # original implementation always outputs a tuple out of the multihead attention code
         self_outputs = (self_outputs,)
@@ -1093,15 +1103,24 @@ class BridgeTowerBertCrossLayer_NVTE(nn.Module):
         past_key_value=None,
         output_attentions=False,
         layer_type="",
+        cu_seqlens_text: Optional[torch.Tensor] = None,
+        seq_len_text: Optional[int] = None,
+        cu_seqlens_image: Optional[torch.Tensor] = None,
+        seq_len_image: Optional[int] = None,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        cu_seqlens_self = cu_seqlens_text if layer_type=="text" else cu_seqlens_image
+        max_seqlen_self = seq_len_text if layer_type=="text" else seq_len_image
         self_attention_outputs = self.attention(
             hidden_states,
             attention_mask=attention_mask,
             head_mask=None,
             output_attentions=output_attentions,
             past_key_value=None,
-            attn_mask_type="no_mask" if layer_type=="image" else "padding",
+            attn_mask_type="padding" if (layer_type=="text" and cu_seqlens_self is None) else "no_mask",
+            cu_seqlens_q=cu_seqlens_self, cu_seqlens_kv=cu_seqlens_self,
+            max_seqlen_q=max_seqlen_self, max_seqlen_kv=max_seqlen_self,
+            qkv_format="bshd" if cu_seqlens_self is None else "thd",
         )
         attention_output = self_attention_outputs[0]
 
@@ -1109,6 +1128,8 @@ class BridgeTowerBertCrossLayer_NVTE(nn.Module):
         # add self attentions if we output attention weights
         outputs = self_attention_outputs[1:]
 
+        cu_seqlens_cross = cu_seqlens_image if layer_type=="text" else cu_seqlens_text
+        max_seqlen_cross = seq_len_image if layer_type=="text" else seq_len_text
         cross_attention_outputs = self.crossattention(
             attention_output,
             attention_mask=attention_mask,
@@ -1117,7 +1138,10 @@ class BridgeTowerBertCrossLayer_NVTE(nn.Module):
             encoder_attention_mask=encoder_attention_mask,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
-            attn_mask_type="no_mask" if layer_type=="text" else "padding",
+            attn_mask_type="padding" if (layer_type=="image" and cu_seqlens_cross is None) else "no_mask",
+            cu_seqlens_q=cu_seqlens_self, cu_seqlens_kv=cu_seqlens_cross,
+            max_seqlen_q=max_seqlen_self, max_seqlen_kv=max_seqlen_cross,
+            qkv_format="bshd" if cu_seqlens_cross is None else "thd",
         )
         attention_output = cross_attention_outputs[0]
         intermediate_output, attention_output = self.mlp['c_fc'](cross_attention_outputs[0])
@@ -1437,14 +1461,13 @@ class BridgeTowerTextEncoder(nn.Module):
             indices = indices.repeat(1, hidden_states.shape[1])
             hidden_states = torch.gather(hidden_states, 0, indices)[:num_nonzeros,:]
 
-            return hidden_states, cu_seqlens, indices, pad_amount, seq_len
-        return hidden_states, None, None, None, hidden_states.size(1)
+            return hidden_states, cu_seqlens, indices, pad_amount, seq_len, bs
+        return hidden_states, None, None, None, hidden_states.size(1), bs
 
     def forward_post(self, hidden_states: torch.Tensor, indices: torch.Tensor = None, padded_tokens: int = None, seq_len: int = None):
         text_output_post = hidden_states
         if seq_len is not None:
             indices = indices[:hidden_states.size(0),:]
-            #print (f'forward_post hidden_states {hidden_states.shape} indices {indices.shape} padded_tokens {padded_tokens} seq_len {seq_len}')
             assert padded_tokens is not None and hidden_states.dim() == 2 and indices is not None
             text_output_post = torch.zeros(hidden_states.size(0)+padded_tokens+1, hidden_states.size(1), dtype=hidden_states.dtype, device=hidden_states.device)
             text_output_post.scatter_(0, indices, hidden_states)
@@ -1972,7 +1995,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         extend_text_masks = self.text_model.get_extended_attention_mask(attention_mask, input_shape).to(
             input_ids.device
         )
-        text_embeds, cu_seqlens_text, indices, n_pad, seq_len_text = self.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
+        text_embeds, cu_seqlens_text, indices, n_pad, seq_len_text, bs = self.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
 
         # The split_index determines how many layers of the uni-modal encoder are applied before the cross-modal encoder
         split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
@@ -1981,6 +2004,8 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             image_embeds, cu_seqlens_image, seq_len_image = self.vision_model.visual.forward_pre(pixel_values.type(self.vision_model.dtype))
         else:
             # Permute as BridgeTowerResidualAttention has batch_first=True
+            seq_len_image = image_embeds.size(1)
+            cu_seqlens_image = None
             image_embeds = image_embeds.permute(1, 0, 2)
 
         if output_hidden_states:
@@ -2000,7 +2025,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image)
                 if output_hidden_states:
                     if USE_NVTE_RESIDUAL_ATTN:
-                        all_hidden_states_image += (image_embeds.view(-1, seq_len_image, image_embeds.size(1)),)
+                        all_hidden_states_image += (image_embeds.view(bs, seq_len_image, -1),)
 #                        all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
                     else:
                         all_hidden_states_image += (image_embeds,)
@@ -2019,16 +2044,16 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 if output_hidden_states:
                     all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
                     if USE_NVTE_RESIDUAL_ATTN:
-                        all_hidden_states_image += (image_embeds.view(-1, seq_len_image, image_embeds.size(1)),)
+                        all_hidden_states_image += (image_embeds.view(bs, seq_len_image, -1),)
 #                        all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
                     else:
                         all_hidden_states_image += (image_embeds,)
 
-        image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype), seq_len_image)
+        image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))#, seq_len_image)
         #text_embeds = self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
 
         # first layer is a special case because we don't have the output from the cross-encoder yet
-        cross_modal_text = self.cross_modal_text_transform(self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text))
+        cross_modal_text = self.cross_modal_text_transform(text_embeds)
 
         text_token_type_embeddings = self.token_type_embeddings(
             torch.zeros(1, dtype=torch.long, device=input_ids.device)
@@ -2045,7 +2070,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         cross_modal_image = self.cross_modal_image_layernorm(image_embeds_with_ln)
 
         pixel_mask = torch.ones(
-            (cross_modal_image.size(0), cross_modal_image.size(1)),
+            (bs, seq_len_image),
             dtype=torch.long,
             device=input_ids.device,
         )
@@ -2060,6 +2085,8 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             encoder_attention_mask=extend_image_masks,
             output_attentions=output_attentions,
             layer_type="text",
+            cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
+            cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
         )
         cross_text_features = layer_outputs_text[0]
 
@@ -2070,11 +2097,13 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             encoder_attention_mask=extend_text_masks,
             output_attentions=output_attentions,
             layer_type="image",
+            cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
+            cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
         )
         cross_image_features = layer_outputs_image[0]
 
         if output_hidden_states:
-            all_hidden_states_cross += ((cross_text_features, cross_image_features),)
+            all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text), cross_image_features.view(bs, seq_len_image, -1)),)
 
         if output_attentions:
             all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
@@ -2098,7 +2127,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 )
                 torch.cuda.current_stream().wait_stream(self.text_model_stream)
             image_embeds_with_ln = (
-                self.cross_modal_image_transform(self.vision_model.visual.forward_post(image_embeds, seq_len_image))
+                self.cross_modal_image_transform(self.vision_model.visual.forward_post(image_embeds))
                 + image_token_type_embeddings
             )
 
@@ -2107,7 +2136,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
 
             # Bridge layers for textual and visual encoders
             cross_text_features_ = text_link_tower(
-                self.cross_modal_text_transform(self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)) + text_token_type_embeddings,
+                self.cross_modal_text_transform(text_embeds) + text_token_type_embeddings,
                 cross_text_features,
                 extend_text_masks,
             )
@@ -2121,6 +2150,8 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 encoder_attention_mask=extend_image_masks,
                 output_attentions=output_attentions,
                 layer_type="text",
+                cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
+                cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
             )
             cross_text_features = layer_outputs_text[0]
 
@@ -2131,6 +2162,8 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 encoder_attention_mask=extend_text_masks,
                 output_attentions=output_attentions,
                 layer_type="image",
+                cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
+                cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
             )
             cross_image_features = layer_outputs_image[0]
 
@@ -2139,17 +2172,21 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
                 if USE_NVTE_RESIDUAL_ATTN:
-                    all_hidden_states_image += (image_embeds.view(-1, seq_len_image, image_embeds.size(1)),)
+                    all_hidden_states_image += (image_embeds.view(bs, seq_len_image, -1),)
 #                    all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
                 else:
                     all_hidden_states_image += (image_embeds,)
-                all_hidden_states_cross += ((cross_text_features, cross_image_features),)
+                all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text), cross_image_features.view(bs, seq_len_image, -1)),)
 
             if output_attentions:
                 all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
 
         if USE_NVTE_RESIDUAL_ATTN:
-            image_embeds = image_embeds.view(-1, seq_len_image, image_embeds.size(1))
+            image_embeds = image_embeds.view(bs, seq_len_image, -1)
+        cross_text_features = self.text_model.encoder.forward_post(cross_text_features, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
+        text_token_type_embeddings = self.text_model.encoder.forward_post(text_token_type_embeddings, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
+        cross_image_features = cross_image_features.view(bs, seq_len_image, -1)
+        image_token_type_embeddings = image_token_type_embeddings.view(bs, seq_len_image, -1)
 #            image_embeds = image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1))
         #  Concatenate the cls token of the text and image features to get the final represtation
         text_features, image_features = cross_text_features, cross_image_features
