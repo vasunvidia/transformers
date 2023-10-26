@@ -136,6 +136,7 @@ USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
 # TE integration flags for core operations (superceded by per-layer flags)
 USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR')) or USE_NVTE_ALL
 USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
+USE_PAD=bool(os.getenv('USE_PAD'))
 
 @dataclass
 class BridgeTowerModelOutput(ModelOutput):
@@ -476,13 +477,23 @@ class BridgeTowerVisionTransformer(nn.Module):
             hidden_states = hidden_states.permute(1, 0, 2)
             return hidden_states, None, hidden_states.size(0)
         else:
-            seq_len = hidden_states.size(1)
-            cu_seqlens = torch.arange(hidden_states.size(0)+1, dtype=torch.int32,
+            bs, seq_len = hidden_states.size(0), hidden_states.size(1)
+            if USE_PAD:
+                extra_batch = bs
+                cu_seqlens = torch.arange(hidden_states.size(0)+extra_batch+1, dtype=torch.int32,
                         device=hidden_states.device) * seq_len
-            #unpad_shape = hidden_states.shape
-            hidden_states = hidden_states.view(hidden_states.size(0) * hidden_states.size(1), hidden_states.size(2))
-#            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 240))
-            #pad_shape = hidden_states.shape
+                npad = 240
+                if extra_batch > 0:
+                    cu_seqlens[bs+1:] = cu_seqlens[bs] + torch.arange(1, extra_batch+1, dtype=torch.int32,
+                        device=hidden_states.device)
+                    cu_seqlens[-1] = cu_seqlens[bs]+npad
+                hidden_states = hidden_states.view(hidden_states.size(0) * hidden_states.size(1), hidden_states.size(2))
+                if extra_batch > 0:
+                    hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, npad))
+            else:
+                cu_seqlens = torch.arange(hidden_states.size(0)+1, dtype=torch.int32,
+                        device=hidden_states.device) * seq_len
+                hidden_states = hidden_states.view(hidden_states.size(0) * hidden_states.size(1), hidden_states.size(2))
             return hidden_states, cu_seqlens, seq_len
         return hidden_states, None, hidden_states.size(1)
 
@@ -492,7 +503,6 @@ class BridgeTowerVisionTransformer(nn.Module):
             visual_output_post = hidden_state.permute(1, 0, 2)
         elif seq_len is not None:
             visual_output_post = hidden_state.view(-1, seq_len, hidden_state.size(1))
-#            visual_output_post = hidden_state[:-240,:].view(-1, seq_len, hidden_state.size(1))
         visual_output_post = self.ln_post(visual_output_post)
         return visual_output_post
 
@@ -1445,12 +1455,13 @@ class BridgeTowerTextEncoder(nn.Module):
         if USE_NVTE_TEXT_LAYER:
             mask = extend_text_masks.eq(0).squeeze(1).squeeze(1)
             reduced_mask = mask.sum(dim=1)
-            cu_seqlens = torch.zeros(bs+1, dtype=torch.int, device=text_embed.device)
-            cu_seqlens[1:] = reduced_mask.cumsum(dim=0)
-
             mask = mask.reshape(-1)
             indices = mask.nonzero()
             num_nonzeros = indices.size(0)
+            pad_size = bs*40
+            assert num_nonzeros < pad_size
+            npad = pad_size - num_nonzeros
+            extra_batch = bs
             pad_amount = total_tokens - num_nonzeros
             indices = torch.nn.functional.pad(input=indices, pad=(0, 0, 0, pad_amount),
                     mode="constant", value=float(bs * seq_len))
@@ -1461,15 +1472,25 @@ class BridgeTowerTextEncoder(nn.Module):
             indices = indices.repeat(1, hidden_states.shape[1])
             hidden_states = torch.gather(hidden_states, 0, indices)[:num_nonzeros,:]
 
-            return hidden_states, cu_seqlens, indices, pad_amount, seq_len, bs
+            if USE_PAD:
+                cu_seqlens = torch.zeros(bs+extra_batch+1, dtype=torch.int, device=text_embed.device)
+                cu_seqlens[1:bs+1] = reduced_mask.cumsum(dim=0)
+                if extra_batch > 0:
+                    cu_seqlens[bs+1:] = torch.linspace(cu_seqlens[bs]+1, pad_size, extra_batch, dtype=torch.int32,
+                        device=hidden_states.device)
+                hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, npad))
+            else:
+                cu_seqlens = torch.zeros(bs+1, dtype=torch.int, device=text_embed.device)
+                cu_seqlens[1:] = reduced_mask.cumsum(dim=0)
+            return hidden_states, cu_seqlens, indices, num_nonzeros, seq_len, bs
         return hidden_states, None, None, None, hidden_states.size(1), bs
 
-    def forward_post(self, hidden_states: torch.Tensor, indices: torch.Tensor = None, padded_tokens: int = None, seq_len: int = None):
+    def forward_post(self, hidden_states: torch.Tensor, indices: torch.Tensor = None, bs: int = None, seq_len: int = None):
         text_output_post = hidden_states
         if seq_len is not None:
             indices = indices[:hidden_states.size(0),:]
-            assert padded_tokens is not None and hidden_states.dim() == 2 and indices is not None
-            text_output_post = torch.zeros(hidden_states.size(0)+padded_tokens+1, hidden_states.size(1), dtype=hidden_states.dtype, device=hidden_states.device)
+            assert bs is not None and hidden_states.dim() == 2 and indices is not None
+            text_output_post = torch.zeros((bs*seq_len)+1, hidden_states.size(1), dtype=hidden_states.dtype, device=hidden_states.device)
             text_output_post.scatter_(0, indices, hidden_states)
             text_output_post = text_output_post[:-1, :]
             text_output_post = text_output_post.view(-1, seq_len, hidden_states.size(1))
@@ -1995,7 +2016,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         extend_text_masks = self.text_model.get_extended_attention_mask(attention_mask, input_shape).to(
             input_ids.device
         )
-        text_embeds, cu_seqlens_text, indices, n_pad, seq_len_text, bs = self.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
+        text_embeds, cu_seqlens_text, indices, npad_text, seq_len_text, bs = self.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
 
         # The split_index determines how many layers of the uni-modal encoder are applied before the cross-modal encoder
         split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
@@ -2007,9 +2028,10 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             seq_len_image = image_embeds.size(1)
             cu_seqlens_image = None
             image_embeds = image_embeds.permute(1, 0, 2)
+        npad = bs * seq_len_image
 
         if output_hidden_states:
-            all_hidden_states_image += (image_embeds,)
+            all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
 
 
         if not self.overlap_text_vision_layers:
@@ -2018,15 +2040,14 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 text_embeds = layer(text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
 
                 if output_hidden_states:
-                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
+                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
 
             # Run the first 'split_index' layers of the visual encoder
             for block in self.vision_model.visual.transformer.resblocks[:split_index]:
                 image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image)
                 if output_hidden_states:
                     if USE_NVTE_RESIDUAL_ATTN:
-                        all_hidden_states_image += (image_embeds.view(bs, seq_len_image, -1),)
-#                        all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
+                        all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
                     else:
                         all_hidden_states_image += (image_embeds,)
 
@@ -2042,15 +2063,18 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 torch.cuda.current_stream().wait_stream(self.text_model_stream)
 
                 if output_hidden_states:
-                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
+                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
                     if USE_NVTE_RESIDUAL_ATTN:
-                        all_hidden_states_image += (image_embeds.view(bs, seq_len_image, -1),)
-#                        all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
+                        all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
                     else:
                         all_hidden_states_image += (image_embeds,)
 
-        image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))#, seq_len_image)
-        #text_embeds = self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
+        #if USE_PAD:
+        #    image_embeds = image_embeds[:npad,:]
+        #    text_embeds = text_embeds[:npad_text,:]
+        #    cu_seqlens_image = cu_seqlens_image[:-1]
+        #    cu_seqlens_text = cu_seqlens_text[:-1]
+        image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))
 
         # first layer is a special case because we don't have the output from the cross-encoder yet
         cross_modal_text = self.cross_modal_text_transform(text_embeds)
@@ -2103,8 +2127,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         cross_image_features = layer_outputs_image[0]
 
         if output_hidden_states:
-            all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text), cross_image_features.view(bs, seq_len_image, -1)),)
-
+            all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), cross_image_features[:npad,:].view(bs, seq_len_image, -1)),)
         if output_attentions:
             all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
 
@@ -2170,24 +2193,29 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
             link_layer_index += 1
 
             if output_hidden_states:
-                all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text),)
+                all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
                 if USE_NVTE_RESIDUAL_ATTN:
-                    all_hidden_states_image += (image_embeds.view(bs, seq_len_image, -1),)
-#                    all_hidden_states_image += (image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1)),)
+                    all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
                 else:
                     all_hidden_states_image += (image_embeds,)
-                all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text), cross_image_features.view(bs, seq_len_image, -1)),)
+                all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), cross_image_features[:npad,:].view(bs, seq_len_image, -1)),)
 
             if output_attentions:
                 all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
+        if USE_PAD:
+            image_embeds = image_embeds[:npad,:]
+            cross_image_features = cross_image_features[:npad,:]
+            image_token_type_embeddings = image_token_type_embeddings[:npad,:]
+            text_embeds = text_embeds[:npad_text,:]
+            cross_text_features = cross_text_features[:npad_text,:]
+            text_token_type_embeddings = text_token_type_embeddings[:npad_text,:]
 
-        if USE_NVTE_RESIDUAL_ATTN:
-            image_embeds = image_embeds.view(bs, seq_len_image, -1)
-        cross_text_features = self.text_model.encoder.forward_post(cross_text_features, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
-        text_token_type_embeddings = self.text_model.encoder.forward_post(text_token_type_embeddings, indices=indices, padded_tokens=n_pad, seq_len=seq_len_text)
+        image_embeds = image_embeds.view(bs, seq_len_image, -1)
         cross_image_features = cross_image_features.view(bs, seq_len_image, -1)
         image_token_type_embeddings = image_token_type_embeddings.view(bs, seq_len_image, -1)
-#            image_embeds = image_embeds[:-240,:].view(-1, seq_len_image, image_embeds.size(1))
+        text_embeds = self.text_model.encoder.forward_post(text_embeds, indices=indices, bs=bs, seq_len=seq_len_text)
+        cross_text_features = self.text_model.encoder.forward_post(cross_text_features, indices=indices, bs=bs, seq_len=seq_len_text)
+        text_token_type_embeddings = self.text_model.encoder.forward_post(text_token_type_embeddings, indices=indices, bs=bs, seq_len=seq_len_text)
         #  Concatenate the cls token of the text and image features to get the final represtation
         text_features, image_features = cross_text_features, cross_image_features
         cls_features = self.get_cls_features(text_features, image_features)
