@@ -1760,6 +1760,35 @@ class Trainer:
 
         # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
+        # Graph capture
+        if bool(os.getenv('USE_PAD')):
+            avg_seq_len = int(os.getenv('PAD_SEQ_LEN', '64'))
+            epoch_iterator = train_dataloader
+            for step, inputs in enumerate(epoch_iterator):
+                if step == 0:
+                    sample_batch = inputs
+            image_embeds = self.model.bridgetower.graph_captured_model.vision_model.visual.embeddings(sample_batch['pixel_values'].type(self.model.bridgetower.graph_captured_model.vision_model.dtype))
+            image_seq_len = image_embeds.size(1)
+            text_seq_len = sample_batch['input_ids'].size(1)
+
+            image_tokens = self._train_batch_size * image_seq_len
+            padded_image_tokens = image_tokens + 256 - ((image_tokens-1) % 256) - 1
+            hidden_size = self.model.config.hidden_size
+            sample_input_encoder = [
+                torch.ones(avg_seq_len*self._train_batch_size, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=True), #text_embeds
+                torch.ones((2*self._train_batch_size)+1, dtype=torch.int32, device=args.device, requires_grad=False),                      #cu_seqlens_text
+                torch.ones(padded_image_tokens, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=True),                #image_embeds
+                torch.ones((2*self._train_batch_size)+1, dtype=torch.int32, device=args.device, requires_grad=False),                      #cu_seqlens_image
+                torch.ones(1, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=False),                                 #text_token_type_embeddings
+                torch.ones(1, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=False),                                 #image_token_type_embeddings
+                torch.ones(self._train_batch_size, image_seq_len, dtype=torch.int64, device=args.device, requires_grad=False),             #pixel_mask
+                torch.ones(self._train_batch_size, 1, 1, text_seq_len,  dtype=torch.bfloat16, device=args.device, requires_grad=False),    #extend_text_masks
+            ]
+            self.model.bridgetower.graph_captured_model.seq_len_text = text_seq_len
+            self.model.bridgetower.graph_captured_model.seq_len_image = image_seq_len
+            logger.info (f'Enabling make_graphed_callables for encoder with pad_seq_len {avg_seq_len}!!')
+            self.model.bridgetower.graph_captured_model = torch.cuda.make_graphed_callables(self.model.bridgetower.graph_captured_model, tuple(sample_input_encoder), allow_unused_input=True)
+            logger.info ('Graph capture done')
 
         # important: at this point:
         # self.model         is the Transformers Model

@@ -26,6 +26,9 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 
 import transformer_engine.pytorch as te
+from transformer_engine.pytorch import fp8_autocast
+from transformer_engine.common import recipe
+from contextlib import nullcontext
 
 from ...activations import ACT2FN, QuickGELUActivation, GELUActivation
 from ...modeling_outputs import (
@@ -137,6 +140,7 @@ USE_NVTE_ATTENTION=bool(os.getenv('USE_NVTE_ATTENTION')) or USE_NVTE_ALL
 USE_NVTE_LINEAR=bool(os.getenv('USE_NVTE_LINEAR')) or USE_NVTE_ALL
 USE_NVTE_LAYERNORM=bool(os.getenv('USE_NVTE_LAYERNORM')) or USE_NVTE_ALL
 USE_PAD=bool(os.getenv('USE_PAD'))
+USE_FP8=bool(os.getenv('USE_FP8'))
 
 @dataclass
 class BridgeTowerModelOutput(ModelOutput):
@@ -333,7 +337,7 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
                             eps=config.layer_norm_eps
                             )),
                         ("gelu", QuickGELUActivation()),
-                        ("c_proj", nn.Linear(config.hidden_size * 4, config.hidden_size))
+                        ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size))
                     ]
                 )
             )
@@ -981,10 +985,8 @@ class BridgeTowerAttention_NVTE(nn.Module):
             attn_mask_pick = encoder_attention_mask
         else:
             attn_mask_pick = attention_mask
-        attn_mask_pick_bool = attn_mask_pick.ne(0).tile((1,1,attention_mask.size(3),1))
         self_outputs = self.qkv_plus_self_attn(
             hidden_states,
-            attention_mask=attn_mask_pick_bool,
             encoder_output=encoder_hidden_states,
             attn_mask_type=attn_mask_type,
             cu_seqlens_q=cu_seqlens_q,
@@ -1303,7 +1305,6 @@ class BridgeTowerTextLayer_NVTE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -1326,7 +1327,6 @@ class BridgeTowerTextLayer_NVTE(nn.Module):
             query_layer,
             key_layer,
             value_layer,
-            attention_mask=attention_mask.ne(0),
             attn_mask_type="padding" if cu_seqlens is None else "no_mask",
             cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=seq_len, max_seqlen_kv=seq_len,
@@ -1448,41 +1448,43 @@ class BridgeTowerTextEncoder(nn.Module):
         )
 
     def forward_pre(self, text_embed: torch.Tensor, extend_text_masks: torch.Tensor):
-        hidden_states = text_embed
-        bs = extend_text_masks.size(0)
-        seq_len = hidden_states.size(1)
-        total_tokens = bs * seq_len
-        if USE_NVTE_TEXT_LAYER:
-            mask = extend_text_masks.eq(0).squeeze(1).squeeze(1)
-            reduced_mask = mask.sum(dim=1)
-            mask = mask.reshape(-1)
-            indices = mask.nonzero()
-            num_nonzeros = indices.size(0)
-            pad_size = bs*40
-            assert num_nonzeros < pad_size
-            npad = pad_size - num_nonzeros
-            extra_batch = bs
-            pad_amount = total_tokens - num_nonzeros
-            indices = torch.nn.functional.pad(input=indices, pad=(0, 0, 0, pad_amount),
-                    mode="constant", value=float(bs * seq_len))
-            hidden_states = hidden_states.view(total_tokens, -1)
-            extra_row = torch.zeros(1, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
-            hidden_states = torch.cat((hidden_states, extra_row), dim=0)
+        with torch.no_grad():
+            hidden_states = text_embed
+            bs = extend_text_masks.size(0)
+            seq_len = hidden_states.size(1)
+            total_tokens = bs * seq_len
+            if USE_NVTE_TEXT_LAYER:
+                mask = extend_text_masks.eq(0).squeeze(1).squeeze(1)
+                reduced_mask = mask.sum(dim=1)
+                mask = mask.reshape(-1)
+                indices = mask.nonzero()
+                num_nonzeros = indices.size(0)
+                extra_batch = bs
+                pad_amount = total_tokens - num_nonzeros
+                indices = torch.nn.functional.pad(input=indices, pad=(0, 0, 0, pad_amount),
+                        mode="constant", value=float(bs * seq_len))
+                hidden_states = hidden_states.view(total_tokens, -1)
+                extra_row = torch.zeros(1, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+                hidden_states = torch.cat((hidden_states, extra_row), dim=0)
 
-            indices = indices.repeat(1, hidden_states.shape[1])
-            hidden_states = torch.gather(hidden_states, 0, indices)[:num_nonzeros,:]
+                indices = indices.repeat(1, hidden_states.shape[1])
+                hidden_states = torch.gather(hidden_states, 0, indices)[:num_nonzeros,:]
 
-            if USE_PAD:
-                cu_seqlens = torch.zeros(bs+extra_batch+1, dtype=torch.int, device=text_embed.device)
-                cu_seqlens[1:bs+1] = reduced_mask.cumsum(dim=0)
-                if extra_batch > 0:
-                    cu_seqlens[bs+1:] = torch.linspace(cu_seqlens[bs]+1, pad_size, extra_batch, dtype=torch.int32,
-                        device=hidden_states.device)
-                hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, npad))
-            else:
-                cu_seqlens = torch.zeros(bs+1, dtype=torch.int, device=text_embed.device)
-                cu_seqlens[1:] = reduced_mask.cumsum(dim=0)
-            return hidden_states, cu_seqlens, indices, num_nonzeros, seq_len, bs
+                if USE_PAD:
+                    avg_seq_len = int(os.getenv('PAD_SEQ_LEN', '64'))
+                    pad_size = bs*avg_seq_len
+                    assert num_nonzeros < pad_size
+                    npad = pad_size - num_nonzeros
+                    cu_seqlens = torch.zeros(bs+extra_batch+1, dtype=torch.int, device=text_embed.device)
+                    cu_seqlens[1:bs+1] = reduced_mask.cumsum(dim=0)
+                    if extra_batch > 0:
+                        cu_seqlens[bs+1:] = torch.linspace(cu_seqlens[bs]+1, pad_size, extra_batch, dtype=torch.int32,
+                            device=hidden_states.device)
+                    hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, npad))
+                else:
+                    cu_seqlens = torch.zeros(bs+1, dtype=torch.int, device=text_embed.device)
+                    cu_seqlens[1:] = reduced_mask.cumsum(dim=0)
+                return hidden_states, cu_seqlens, indices, num_nonzeros, seq_len, bs
         return hidden_states, None, None, None, hidden_states.size(1), bs
 
     def forward_post(self, hidden_states: torch.Tensor, indices: torch.Tensor = None, bs: int = None, seq_len: int = None):
@@ -1856,6 +1858,213 @@ class BridgeTowerTextModel(BridgeTowerPreTrainedModel):
         )
 
 
+class BridgeTowerGraphModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        vision_config = config.vision_config
+        text_config = config.text_config
+        self.text_model = BridgeTowerTextModel(text_config)
+        self.vision_model = BridgeTowerVisionModel(vision_config)
+        if config.share_cross_modal_transformer_layers:
+            self.cross_modal_text_transform = nn.Linear(text_config.hidden_size, config.hidden_size)
+            self.cross_modal_image_transform = nn.Linear(vision_config.hidden_size, config.hidden_size)
+        else:
+            self.cross_modal_text_transform = nn.ModuleList(
+                [nn.Linear(text_config.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
+            )
+            self.cross_modal_image_transform = nn.ModuleList(
+                [nn.Linear(vision_config.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
+            )
+        # Initialize BridgeTower Components
+        self.cross_modal_text_layernorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.cross_modal_image_layernorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.cross_modal_image_layers = nn.ModuleList(
+            [BridgeTowerBertCrossLayer(text_config, layer_num=i+1) for i in range(config.num_hidden_layers)]
+        )
+        self.cross_modal_text_layers = nn.ModuleList(
+            [BridgeTowerBertCrossLayer(text_config, layer_num=i+1) for i in range(config.num_hidden_layers)]
+        )
+        if config.share_link_tower_layers:
+            self.cross_modal_text_link_tower = BridgeTowerLinkTower(config)
+            self.cross_modal_image_link_tower = BridgeTowerLinkTower(config)
+        else:
+            self.cross_modal_text_link_tower = nn.ModuleList(
+                [BridgeTowerLinkTower(config) for _ in range(config.num_hidden_layers - 1)]
+            )
+            self.cross_modal_image_link_tower = nn.ModuleList(
+                [BridgeTowerLinkTower(config) for _ in range(config.num_hidden_layers - 1)]
+            )
+
+        self.overlap_text_vision_layers = (os.getenv('OVERLAP_TEXT_VISION_CUDA', "0") == "1")
+        self.seq_len_text = None
+        self.seq_len_image = None
+        if self.overlap_text_vision_layers:
+            self.text_model_stream = torch.cuda.Stream()
+        if USE_FP8:
+            fp8_format = recipe.Format.HYBRID
+            fp8_margin = 0
+            fp8_interval = 1
+            self.fp8_recipe = recipe.DelayedScaling(
+                margin=fp8_margin,
+                interval=fp8_interval,
+                fp8_format=fp8_format,
+                amax_history_len=1,
+                amax_compute_algo="most_recent",
+                reduce_amax=False,
+            )
+
+    def forward(
+        self,
+        text_embeds: torch.Tensor,
+        cu_seqlens_text: torch.Tensor,
+        image_embeds: torch.Tensor,
+        cu_seqlens_image: torch.Tensor,
+        text_token_type_embeddings: torch.Tensor,
+        image_token_type_embeddings: torch.Tensor,
+        pixel_mask: torch.Tensor,
+        extend_text_masks: torch.Tensor,
+        output_hidden_states: bool = True,
+        output_attentions: bool = False,
+    ):
+        assert self.seq_len_text is not None
+        assert self.seq_len_image is not None
+        split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
+        all_hidden_states_text = () if output_hidden_states else None
+        all_hidden_states_image = () if output_hidden_states else None
+        all_hidden_states_cross = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+        if USE_FP8:
+            context = fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe)
+        else:
+            context = nullcontext()
+        with context:
+            if not self.overlap_text_vision_layers:
+                # Run the first 'split_index' layers of the textual encoder
+                for layer in self.text_model.encoder.layer[:split_index]:
+                    text_embeds = layer(text_embeds, cu_seqlens=cu_seqlens_text, seq_len=self.seq_len_text)[0]
+
+                    if output_hidden_states:
+                        all_hidden_states_text += (text_embeds,)
+
+                # Run the first 'split_index' layers of the visual encoder
+                for block in self.vision_model.visual.transformer.resblocks[:split_index]:
+                    image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=self.seq_len_image)
+                    if output_hidden_states:
+                        all_hidden_states_image += (image_embeds,)
+
+            else:
+                # Run the first 'split_index' layers of textual and visual encoder layers
+                for i, layer in enumerate(self.text_model.encoder.layer[:split_index]):
+                    block = self.vision_model.visual.transformer.resblocks[i]
+
+                    self.text_model_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.text_model_stream):
+                        text_embeds = layer(text_embeds, cu_seqlens=cu_seqlens_text, seq_len=self.seq_len_text)[0]
+                    image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=self.seq_len_image)
+                    torch.cuda.current_stream().wait_stream(self.text_model_stream)
+
+                    if output_hidden_states:
+                        all_hidden_states_text += (text_embeds,)
+                        all_hidden_states_image += (image_embeds,)
+            image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))
+            # first layer is a special case because we don't have the output from the cross-encoder yet
+            cross_modal_text = self.cross_modal_text_transform(text_embeds)
+            text_token_type_embeddings = text_token_type_embeddings.expand_as(cross_modal_text)
+            cross_modal_text = self.cross_modal_text_layernorm(cross_modal_text + text_token_type_embeddings)
+
+            image_embeds_with_ln = self.cross_modal_image_transform(image_embeds_with_ln)
+            image_token_type_embeddings = image_token_type_embeddings.expand_as(image_embeds_with_ln)
+            image_embeds_with_ln = image_embeds_with_ln + image_token_type_embeddings
+            cross_modal_image = self.cross_modal_image_layernorm(image_embeds_with_ln)
+
+            extend_image_masks = self.text_model.get_extended_attention_mask(pixel_mask, pixel_mask.size()).to(
+                cross_modal_image.device
+            )
+            layer_outputs_text = self.cross_modal_text_layers[0](
+                cross_modal_text,
+                cross_modal_image,
+                layer_type="text",
+                cu_seqlens_text=cu_seqlens_text, seq_len_text=self.seq_len_text,
+                cu_seqlens_image=cu_seqlens_image, seq_len_image=self.seq_len_image,
+            )
+            cross_text_features = layer_outputs_text[0]
+
+            layer_outputs_image = self.cross_modal_image_layers[0](
+                cross_modal_image,
+                cross_modal_text,
+                layer_type="image",
+                cu_seqlens_text=cu_seqlens_text, seq_len_text=self.seq_len_text,
+                cu_seqlens_image=cu_seqlens_image, seq_len_image=self.seq_len_image,
+            )
+            cross_image_features = layer_outputs_image[0]
+            if output_hidden_states:
+                all_hidden_states_cross += ((cross_text_features, cross_image_features),)
+            if output_attentions:
+                all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
+
+            link_layer_index = 0
+
+            #  Each of the top 6 layers of the visual and textual encoders ([split_index:]) is connected to each layer of
+            #  the cross-modal encoder via bridge layers, which brings bottom-up alignment and fusion to the cross-modal encoder.
+            for i in range(split_index, len(self.text_model.encoder.layer)):
+                if not self.overlap_text_vision_layers:
+                    text_embeds = self.text_model.encoder.layer[i](text_embeds, cu_seqlens=cu_seqlens_text, seq_len=self.seq_len_text)[0]
+                    image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds, cu_seqlens=cu_seqlens_image, seq_len=self.seq_len_image).type(
+                        self.vision_model.dtype
+                    )
+                else:
+                    self.text_model_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.text_model_stream):
+                        text_embeds = self.text_model.encoder.layer[i](text_embeds, cu_seqlens=cu_seqlens_text, seq_len=self.seq_len_text)[0]
+                    image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds, cu_seqlens=cu_seqlens_image, seq_len=self.seq_len_image).type(
+                        self.vision_model.dtype
+                    )
+                    torch.cuda.current_stream().wait_stream(self.text_model_stream)
+                image_embeds_with_ln = (
+                    self.cross_modal_image_transform(self.vision_model.visual.forward_post(image_embeds))
+                    + image_token_type_embeddings
+                )
+                text_link_tower = self.cross_modal_text_link_tower[link_layer_index]
+                image_link_tower = self.cross_modal_image_link_tower[link_layer_index]
+
+                # Bridge layers for textual and visual encoders
+                cross_text_features_ = text_link_tower(
+                    self.cross_modal_text_transform(text_embeds) + text_token_type_embeddings,
+                    cross_text_features,
+                    extend_text_masks,
+                )
+                cross_image_features_ = image_link_tower(image_embeds_with_ln, cross_image_features, extend_image_masks)
+
+                # Cross-modal encoder via bridge layers of textual and visual encoders
+                layer_outputs_text = self.cross_modal_text_layers[link_layer_index + 1](
+                    cross_text_features_,
+                    cross_image_features_,
+                    layer_type="text",
+                    cu_seqlens_text=cu_seqlens_text, seq_len_text=self.seq_len_text,
+                    cu_seqlens_image=cu_seqlens_image, seq_len_image=self.seq_len_image,
+                )
+                cross_text_features = layer_outputs_text[0]
+
+                layer_outputs_image = self.cross_modal_image_layers[link_layer_index + 1](
+                    cross_image_features_,
+                    cross_text_features_,
+                    layer_type="image",
+                    cu_seqlens_text=cu_seqlens_text, seq_len_text=self.seq_len_text,
+                    cu_seqlens_image=cu_seqlens_image, seq_len_image=self.seq_len_image,
+                )
+                cross_image_features = layer_outputs_image[0]
+
+                link_layer_index += 1
+
+                if output_hidden_states:
+                    all_hidden_states_text += (text_embeds,)
+                    all_hidden_states_image += (image_embeds,)
+                    all_hidden_states_cross += ((cross_text_features, cross_image_features),)
+                if output_attentions:
+                    all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
+        return text_embeds, cross_text_features, text_token_type_embeddings, image_embeds, cross_image_features, image_token_type_embeddings, all_hidden_states_text, all_hidden_states_image, all_hidden_states_cross
+
 @add_start_docstrings(
     "The bare BridgeTower Model transformer outputting BridgeTowerModelOutput object without any specific head on"
     " top.",
@@ -1868,80 +2077,30 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         vision_config = config.vision_config
         text_config = config.text_config
 
-        if config.share_cross_modal_transformer_layers:
-            if USE_NVTE_LINEAR:
-                self.cross_modal_text_transform = te.Linear(text_config.hidden_size, config.hidden_size)
-                self.cross_modal_image_transform = te.Linear(vision_config.hidden_size, config.hidden_size)
-            else:
-                self.cross_modal_text_transform = nn.Linear(text_config.hidden_size, config.hidden_size)
-                self.cross_modal_image_transform = nn.Linear(vision_config.hidden_size, config.hidden_size)
-        else:
-            if USE_NVTE_LINEAR:
-                self.cross_modal_text_transform = nn.ModuleList( 
-                    [te.Linear(text_config.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
-                )
-                self.cross_modal_image_transform = nn.ModuleList(
-                    [te.Linear(vision_config.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
-                )
-            else:
-                self.cross_modal_text_transform = nn.ModuleList(
-                    [nn.Linear(text_config.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
-                )
-                self.cross_modal_image_transform = nn.ModuleList(
-                    [nn.Linear(vision_config.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
-                )
-
         self.token_type_embeddings = nn.Embedding(2, config.hidden_size)
 
-        self.vision_model = BridgeTowerVisionModel(vision_config)
+        self.graph_captured_model = BridgeTowerGraphModel(config)
 
-        self.text_model = BridgeTowerTextModel(text_config)
         self.overlap_text_vision_layers = (os.getenv('OVERLAP_TEXT_VISION_CUDA', "0") == "1")
         if self.overlap_text_vision_layers:
             self.text_model_stream = torch.cuda.Stream()
 
         if not vision_config.share_layernorm and config.init_layernorm_from_vision_encoder:
-            for ln in self.vision_model.visual.cross_modal_ln_separate:
-                ln.weight.data = self.vision_model.visual.ln_post.weight.data
-                ln.bias.data = self.vision_model.visual.ln_post.bias.data
-
-        self.cross_modal_image_layers = nn.ModuleList(
-            [BridgeTowerBertCrossLayer(text_config, layer_num=i+1) for i in range(config.num_hidden_layers)]
-        )
-        self.cross_modal_text_layers = nn.ModuleList(
-            [BridgeTowerBertCrossLayer(text_config, layer_num=i+1) for i in range(config.num_hidden_layers)]
-        )
+            for ln in self.graph_captured_model.vision_model.visual.cross_modal_ln_separate:
+                ln.weight.data = self.graph_captured_model.vision_model.visual.ln_post.weight.data
+                ln.bias.data = self.graph_captured_model.vision_model.visual.ln_post.bias.data
 
         # Class token => Linear => Tanh
         self.cross_modal_image_pooler = BridgeTowerPooler(config)
         self.cross_modal_text_pooler = BridgeTowerPooler(config)
 
-        # Initialize BridgeTower Components
-        if USE_NVTE_LAYERNORM:
-            self.cross_modal_text_layernorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-            self.cross_modal_image_layernorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        else:
-            self.cross_modal_text_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-            self.cross_modal_image_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        if config.share_link_tower_layers:
-            self.cross_modal_text_link_tower = BridgeTowerLinkTower(config)
-            self.cross_modal_image_link_tower = BridgeTowerLinkTower(config)
-        else:
-            self.cross_modal_text_link_tower = nn.ModuleList(
-                [BridgeTowerLinkTower(config) for _ in range(config.num_hidden_layers - 1)]
-            )
-            self.cross_modal_image_link_tower = nn.ModuleList(
-                [BridgeTowerLinkTower(config) for _ in range(config.num_hidden_layers - 1)]
-            )
-
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.text_model.get_input_embeddings()
+        return self.graph_captured_model.text_model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.text_model.set_input_embeddings(value)
+        self.graph_captured_model.text_model.set_input_embeddings(value)
 
     @add_start_docstrings_to_model_forward(BRIDGETOWER_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BridgeTowerModelOutput, config_class=_CONFIG_FOR_DOC)
@@ -2005,24 +2164,23 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         image_token_type_idx = image_token_type_idx if image_token_type_idx else 1
         input_shape = input_ids.size()
-
-        text_embeds = self.text_model.embeddings(input_ids=input_ids)
+        text_embeds = self.graph_captured_model.text_model.embeddings(input_ids=input_ids)
 
         if output_hidden_states:
             all_hidden_states_text += (text_embeds,)
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, dtype=torch.long, device=input_ids.device)
-        extend_text_masks = self.text_model.get_extended_attention_mask(attention_mask, input_shape).to(
+        extend_text_masks = self.graph_captured_model.text_model.get_extended_attention_mask(attention_mask, input_shape).to(
             input_ids.device
         )
-        text_embeds, cu_seqlens_text, indices, npad_text, seq_len_text, bs = self.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
+        text_embeds, cu_seqlens_text, indices, npad_text, seq_len_text, bs = self.graph_captured_model.text_model.encoder.forward_pre(text_embeds, extend_text_masks)
 
         # The split_index determines how many layers of the uni-modal encoder are applied before the cross-modal encoder
-        split_index = len(self.text_model.encoder.layer) - self.config.num_hidden_layers + 1
+        split_index = len(self.graph_captured_model.text_model.encoder.layer) - self.config.num_hidden_layers + 1
 
         if image_embeds is None:
-            image_embeds, cu_seqlens_image, seq_len_image = self.vision_model.visual.forward_pre(pixel_values.type(self.vision_model.dtype))
+            image_embeds, cu_seqlens_image, seq_len_image = self.graph_captured_model.vision_model.visual.forward_pre(pixel_values.type(self.graph_captured_model.vision_model.dtype))
         else:
             # Permute as BridgeTowerResidualAttention has batch_first=True
             seq_len_image = image_embeds.size(1)
@@ -2032,173 +2190,37 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
 
         if output_hidden_states:
             all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
-
-
-        if not self.overlap_text_vision_layers:
-            # Run the first 'split_index' layers of the textual encoder
-            for layer in self.text_model.encoder.layer[:split_index]:
-                text_embeds = layer(text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
-
-                if output_hidden_states:
-                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
-
-            # Run the first 'split_index' layers of the visual encoder
-            for block in self.vision_model.visual.transformer.resblocks[:split_index]:
-                image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image)
-                if output_hidden_states:
-                    if USE_NVTE_RESIDUAL_ATTN:
-                        all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
-                    else:
-                        all_hidden_states_image += (image_embeds,)
-
-        else:
-            # Run the first 'split_index' layers of textual and visual encoder layers
-            for i, layer in enumerate(self.text_model.encoder.layer[:split_index]):
-                block = self.vision_model.visual.transformer.resblocks[i]
-
-                self.text_model_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.text_model_stream):
-                    text_embeds = layer(text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
-                image_embeds = block(image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image)
-                torch.cuda.current_stream().wait_stream(self.text_model_stream)
-
-                if output_hidden_states:
-                    all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
-                    if USE_NVTE_RESIDUAL_ATTN:
-                        all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
-                    else:
-                        all_hidden_states_image += (image_embeds,)
-
-        #if USE_PAD:
-        #    image_embeds = image_embeds[:npad,:]
-        #    text_embeds = text_embeds[:npad_text,:]
-        #    cu_seqlens_image = cu_seqlens_image[:-1]
-        #    cu_seqlens_text = cu_seqlens_text[:-1]
-        image_embeds_with_ln = self.vision_model.visual.forward_post(image_embeds.type(self.vision_model.dtype))
-
-        # first layer is a special case because we don't have the output from the cross-encoder yet
-        cross_modal_text = self.cross_modal_text_transform(text_embeds)
-
         text_token_type_embeddings = self.token_type_embeddings(
             torch.zeros(1, dtype=torch.long, device=input_ids.device)
-        ).expand_as(cross_modal_text)
-
-        cross_modal_text = self.cross_modal_text_layernorm(cross_modal_text + text_token_type_embeddings)
-
-        image_embeds_with_ln = self.cross_modal_image_transform(image_embeds_with_ln)
+        )
         image_token_type_embeddings = self.token_type_embeddings(
             torch.full((1,), image_token_type_idx, dtype=torch.long, device=input_ids.device)
-        ).expand_as(image_embeds_with_ln)
-
-        image_embeds_with_ln = image_embeds_with_ln + image_token_type_embeddings
-        cross_modal_image = self.cross_modal_image_layernorm(image_embeds_with_ln)
-
+        )
         pixel_mask = torch.ones(
             (bs, seq_len_image),
             dtype=torch.long,
             device=input_ids.device,
         )
-        extend_image_masks = self.text_model.get_extended_attention_mask(pixel_mask, pixel_mask.size()).to(
-            input_ids.device
-        )
 
-        layer_outputs_text = self.cross_modal_text_layers[0](
-            cross_modal_text,
-            cross_modal_image,
-            attention_mask=extend_text_masks,
-            encoder_attention_mask=extend_image_masks,
-            output_attentions=output_attentions,
-            layer_type="text",
-            cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
-            cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
-        )
-        cross_text_features = layer_outputs_text[0]
-
-        layer_outputs_image = self.cross_modal_image_layers[0](
-            cross_modal_image,
-            cross_modal_text,
-            attention_mask=extend_image_masks,
-            encoder_attention_mask=extend_text_masks,
-            output_attentions=output_attentions,
-            layer_type="image",
-            cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
-            cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
-        )
-        cross_image_features = layer_outputs_image[0]
-
-        if output_hidden_states:
-            all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), cross_image_features[:npad,:].view(bs, seq_len_image, -1)),)
-        if output_attentions:
-            all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
-
-        link_layer_index = 0
-
-        #  Each of the top 6 layers of the visual and textual encoders ([split_index:]) is connected to each layer of
-        #  the cross-modal encoder via bridge layers, which brings bottom-up alignment and fusion to the cross-modal encoder.
-        for i in range(split_index, len(self.text_model.encoder.layer)):
-            if not self.overlap_text_vision_layers:
-                text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
-                image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image).type(
-                    self.vision_model.dtype
-                )
-            else:
-                self.text_model_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.text_model_stream):
-                    text_embeds = self.text_model.encoder.layer[i](text_embeds, extend_text_masks, cu_seqlens=cu_seqlens_text, seq_len=seq_len_text)[0]
-                image_embeds = self.vision_model.visual.transformer.resblocks[i](image_embeds, cu_seqlens=cu_seqlens_image, seq_len=seq_len_image).type(
-                    self.vision_model.dtype
-                )
-                torch.cuda.current_stream().wait_stream(self.text_model_stream)
-            image_embeds_with_ln = (
-                self.cross_modal_image_transform(self.vision_model.visual.forward_post(image_embeds))
-                + image_token_type_embeddings
-            )
-
-            text_link_tower = self.cross_modal_text_link_tower[link_layer_index]
-            image_link_tower = self.cross_modal_image_link_tower[link_layer_index]
-
-            # Bridge layers for textual and visual encoders
-            cross_text_features_ = text_link_tower(
-                self.cross_modal_text_transform(text_embeds) + text_token_type_embeddings,
-                cross_text_features,
+        self.graph_captured_model.seq_len_text = seq_len_text
+        self.graph_captured_model.seq_len_image = seq_len_image
+        text_embeds, cross_text_features, text_token_type_embeddings, image_embeds, cross_image_features, image_token_type_embeddings, partial_hidden_states_text, partial_hidden_states_image, partial_hidden_states_cross = self.graph_captured_model(
+                text_embeds,
+                cu_seqlens_text,
+                image_embeds,
+                cu_seqlens_image,
+                text_token_type_embeddings,
+                image_token_type_embeddings,
+                pixel_mask,
                 extend_text_masks,
-            )
-            cross_image_features_ = image_link_tower(image_embeds_with_ln, cross_image_features, extend_image_masks)
-
-            # Cross-modal encoder via bridge layers of textual and visual encoders
-            layer_outputs_text = self.cross_modal_text_layers[link_layer_index + 1](
-                cross_text_features_,
-                cross_image_features_,
-                attention_mask=extend_text_masks,
-                encoder_attention_mask=extend_image_masks,
-                output_attentions=output_attentions,
-                layer_type="text",
-                cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
-                cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
-            )
-            cross_text_features = layer_outputs_text[0]
-
-            layer_outputs_image = self.cross_modal_image_layers[link_layer_index + 1](
-                cross_image_features_,
-                cross_text_features_,
-                attention_mask=extend_image_masks,
-                encoder_attention_mask=extend_text_masks,
-                output_attentions=output_attentions,
-                layer_type="image",
-                cu_seqlens_text=cu_seqlens_text, seq_len_text=seq_len_text,
-                cu_seqlens_image=cu_seqlens_image, seq_len_image=seq_len_image,
-            )
-            cross_image_features = layer_outputs_image[0]
-
-            link_layer_index += 1
-
-            if output_hidden_states:
-                all_hidden_states_text += (self.text_model.encoder.forward_post(text_embeds[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
-                if USE_NVTE_RESIDUAL_ATTN:
-                    all_hidden_states_image += (image_embeds[:npad,:].view(bs, seq_len_image, -1),)
-                else:
-                    all_hidden_states_image += (image_embeds,)
-                all_hidden_states_cross += ((self.text_model.encoder.forward_post(cross_text_features[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), cross_image_features[:npad,:].view(bs, seq_len_image, -1)),)
+        )
+        if output_hidden_states:
+            for i, text_embeds_out in enumerate(partial_hidden_states_text):
+                all_hidden_states_text += (self.graph_captured_model.text_model.encoder.forward_post(text_embeds_out[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
+            for i, image_embeds_out in enumerate(partial_hidden_states_image):
+                all_hidden_states_image += (image_embeds_out[:npad,:].view(bs, seq_len_image, -1),)
+            for i, hidden_states_cross_out in enumerate(partial_hidden_states_cross):
+                all_hidden_states_cross += ((self.graph_captured_model.text_model.encoder.forward_post(hidden_states_cross_out[0][:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), hidden_states_cross_out[1][:npad,:].view(bs, seq_len_image, -1)),)
 
             if output_attentions:
                 all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
@@ -2213,9 +2235,9 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         image_embeds = image_embeds.view(bs, seq_len_image, -1)
         cross_image_features = cross_image_features.view(bs, seq_len_image, -1)
         image_token_type_embeddings = image_token_type_embeddings.view(bs, seq_len_image, -1)
-        text_embeds = self.text_model.encoder.forward_post(text_embeds, indices=indices, bs=bs, seq_len=seq_len_text)
-        cross_text_features = self.text_model.encoder.forward_post(cross_text_features, indices=indices, bs=bs, seq_len=seq_len_text)
-        text_token_type_embeddings = self.text_model.encoder.forward_post(text_token_type_embeddings, indices=indices, bs=bs, seq_len=seq_len_text)
+        text_embeds = self.graph_captured_model.text_model.encoder.forward_post(text_embeds, indices=indices, bs=bs, seq_len=seq_len_text)
+        cross_text_features = self.graph_captured_model.text_model.encoder.forward_post(cross_text_features, indices=indices, bs=bs, seq_len=seq_len_text)
+        text_token_type_embeddings = self.graph_captured_model.text_model.encoder.forward_post(text_token_type_embeddings, indices=indices, bs=bs, seq_len=seq_len_text)
         #  Concatenate the cls token of the text and image features to get the final represtation
         text_features, image_features = cross_text_features, cross_image_features
         cls_features = self.get_cls_features(text_features, image_features)
@@ -2619,12 +2641,12 @@ class BridgeTowerForContrastiveLearning(BridgeTowerPreTrainedModel):
         text_embeds = hidden_states_txt[-1]
         image_embeds = hidden_states_img[-1]
 
-        image_embeds_with_ln = self.bridgetower.vision_model.visual.forward_post(image_embeds)
+        image_embeds_with_ln = self.bridgetower.graph_captured_model.vision_model.visual.forward_post(image_embeds)
         image_token_type_embeddings = self.bridgetower.token_type_embeddings(
             torch.full((1,), 1, dtype=torch.long, device=self.bridgetower.token_type_embeddings.weight.device)
         ).expand_as(image_embeds_with_ln)
 
-        image_embeds = self.bridgetower.cross_modal_image_transform(image_embeds_with_ln) + image_token_type_embeddings
+        image_embeds = self.bridgetower.graph_captured_model.cross_modal_image_transform(image_embeds_with_ln) + image_token_type_embeddings
 
         # normalized features
         text_embeds = nn.functional.normalize(self.itc_text_head(text_embeds[:, 0, :]), dim=-1, p=2)

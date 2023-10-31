@@ -3370,7 +3370,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 for key in state_dict.keys():
                     new_key = None
                     key = _fix_key(key)
-                    if USE_NVTE_RESIDUAL_ATTN and 'vision_model.visual.transformer.resblocks' in key:
+                    if USE_NVTE_RESIDUAL_ATTN and 'vision_model' in key:
+                        new_key = key.replace('vision_model', 'graph_captured_model.vision_model')
                         if USE_NVTE_TF_LAYER:
                             mha_prefix = 'tf_layer.self_attention'
                             ln2_prefix = 'tf_layer.layernorm_mlp'
@@ -3386,59 +3387,60 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                             mha_prefix = 'attn_with_input_layernorm'
                             ln2_prefix = 'mlp.layernorm_linear'
                             if 'mlp.c_fc.weight' in key:
-                                new_key = key.replace('mlp.c_fc.weight', 'mlp.layernorm_linear.weight')
+                                new_key = new_key.replace('mlp.c_fc.weight', 'mlp.layernorm_linear.weight')
                             if 'mlp.c_fc.bias' in key:
-                                new_key = key.replace('mlp.c_fc.bias', f'mlp.layernorm_linear.bias')
+                                new_key = new_key.replace('mlp.c_fc.bias', f'mlp.layernorm_linear.bias')
                         if 'ln_1.weight' in key:
-                            new_key = key.replace('ln_1.weight', f'{mha_prefix}.layernorm_qkv.layer_norm_weight')
+                            new_key = new_key.replace('ln_1.weight', f'{mha_prefix}.layernorm_qkv.layer_norm_weight')
                         if 'ln_1.bias' in key:
-                            new_key = key.replace('ln_1.bias', f'{mha_prefix}.layernorm_qkv.layer_norm_bias')
+                            new_key = new_key.replace('ln_1.bias', f'{mha_prefix}.layernorm_qkv.layer_norm_bias')
                         if 'attn.in_proj_weight' in key:
-                            new_key = key.replace('attn.in_proj_weight', f'{mha_prefix}.layernorm_qkv.weight')
+                            new_key = new_key.replace('attn.in_proj_weight', f'{mha_prefix}.layernorm_qkv.weight')
                         if 'attn.in_proj_bias' in key:
-                            new_key =  key.replace('attn.in_proj_bias', f'{mha_prefix}.layernorm_qkv.bias')
+                            new_key =  new_key.replace('attn.in_proj_bias', f'{mha_prefix}.layernorm_qkv.bias')
                         if 'attn.out_proj.weight' in key:
-                            new_key = key.replace('attn.out_proj.weight', f'{mha_prefix}.proj.weight')
+                            new_key = new_key.replace('attn.out_proj.weight', f'{mha_prefix}.proj.weight')
                         if 'attn.out_proj.bias' in key:
-                            new_key =  key.replace('attn.out_proj.bias', f'{mha_prefix}.proj.bias')
+                            new_key =  new_key.replace('attn.out_proj.bias', f'{mha_prefix}.proj.bias')
                         if 'ln_2.weight' in key:
-                            new_key = key.replace('ln_2.weight', f'{ln2_prefix}.layer_norm_weight')
+                            new_key = new_key.replace('ln_2.weight', f'{ln2_prefix}.layer_norm_weight')
                         if 'ln_2.bias' in key:
-                            new_key = key.replace('ln_2.bias', f'{ln2_prefix}.layer_norm_bias')
-                    elif USE_NVTE_TEXT_LAYER and 'text_model.encoder.layer' in key:
+                            new_key = new_key.replace('ln_2.bias', f'{ln2_prefix}.layer_norm_bias')
+                    elif USE_NVTE_TEXT_LAYER and 'text_model' in key:
+                        new_key = key.replace('text_model', 'graph_captured_model.text_model')
                         if 'attention.self.query.weight' in key:
-                            new_key = key.replace('attention.self.query.weight', 'attention.q_layer.weight')
+                            new_key = new_key.replace('attention.self.query.weight', 'attention.q_layer.weight')
                         if 'attention.self.query.bias' in key:
-                            new_key = key.replace('attention.self.query.bias', 'attention.q_layer.bias')
+                            new_key = new_key.replace('attention.self.query.bias', 'attention.q_layer.bias')
                         if 'attention.self.key.weight' in key:
-                            new_key = key.replace('attention.self.key.weight', 'attention.k_layer.weight')
+                            new_key = new_key.replace('attention.self.key.weight', 'attention.k_layer.weight')
                         if 'attention.self.key.bias' in key:
-                            new_key = key.replace('attention.self.key.bias', 'attention.k_layer.bias')
+                            new_key = new_key.replace('attention.self.key.bias', 'attention.k_layer.bias')
                         if 'attention.self.value.weight' in key:
-                            new_key = key.replace('attention.self.value.weight', 'attention.v_layer.weight')
+                            new_key = new_key.replace('attention.self.value.weight', 'attention.v_layer.weight')
                         if 'attention.self.value.bias' in key:
-                            new_key = key.replace('attention.self.value.bias', 'attention.v_layer.bias')
+                            new_key = new_key.replace('attention.self.value.bias', 'attention.v_layer.bias')
                         if 'attention.output.dense.weight' in key:
-                            new_key = key.replace('attention.output.dense.weight', 'attn_output.dense.weight')
+                            new_key = new_key.replace('attention.output.dense.weight', 'attn_output.dense.weight')
                         if 'attention.output.dense.bias' in key:
-                            new_key = key.replace('attention.output.dense.bias', 'attn_output.dense.bias')
+                            new_key = new_key.replace('attention.output.dense.bias', 'attn_output.dense.bias')
                         if 'attention.output.LayerNorm.weight' in key:
-                            new_key = key.replace('attention.output.LayerNorm.weight', 'attn_output.LayerNorm.weight')
+                            new_key = new_key.replace('attention.output.LayerNorm.weight', 'attn_output.LayerNorm.weight')
                         if 'attention.output.LayerNorm.bias' in key:
-                            new_key = key.replace('attention.output.LayerNorm.bias', 'attn_output.LayerNorm.bias')
+                            new_key = new_key.replace('attention.output.LayerNorm.bias', 'attn_output.LayerNorm.bias')
 
                         if 'intermediate.dense.weight' in key:
-                            new_key = key.replace('intermediate.dense.weight', 'mlp.c_fc.weight')
+                            new_key = new_key.replace('intermediate.dense.weight', 'mlp.c_fc.weight')
                         if 'intermediate.dense.bias' in key:
-                            new_key = key.replace('intermediate.dense.bias', 'mlp.c_fc.bias')
+                            new_key = new_key.replace('intermediate.dense.bias', 'mlp.c_fc.bias')
                         if 'output.dense.weight' in key and 'attention' not in key:
-                            new_key = key.replace('output.dense.weight', 'mlp.c_proj.weight')
+                            new_key = new_key.replace('output.dense.weight', 'mlp.c_proj.weight')
                         if 'output.dense.bias' in key and 'attention' not in key:
-                            new_key = key.replace('output.dense.bias', 'mlp.c_proj.bias')
+                            new_key = new_key.replace('output.dense.bias', 'mlp.c_proj.bias')
                         if 'output.LayerNorm.weight' in key and 'attention' not in key:
-                            new_key = key.replace('output.LayerNorm.weight', 'LayerNorm.weight')
+                            new_key = new_key.replace('output.LayerNorm.weight', 'LayerNorm.weight')
                         if 'output.LayerNorm.bias' in key and 'attention' not in key:
-                            new_key = key.replace('output.LayerNorm.bias', 'LayerNorm.bias')
+                            new_key = new_key.replace('output.LayerNorm.bias', 'LayerNorm.bias')
                     elif USE_NVTE_CROSS_LAYER and ('cross_modal_image_layers' in key or 'cross_modal_text_layers' in key):
                         if 'attention.self.query.weight' in key:
                             new_key = key.replace('attention.self.query.weight', 'attention.qkv_plus_self_attn.qkv.query_weight')
@@ -3493,6 +3495,10 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                             new_key = key.replace('output.LayerNorm.weight', 'LayerNorm.weight')
                         if 'output.LayerNorm.bias' in key and 'attention' not in key:
                             new_key = key.replace('output.LayerNorm.bias', 'LayerNorm.bias')
+                        if new_key:
+                            new_key = new_key.replace('cross_modal', 'graph_captured_model.cross_modal')
+                    elif ('link_tower' in key) or ('cross_modal_image_layernorm' in key) or ('cross_modal_text_layernorm' in key) or ('cross_modal_text_transform' in key) or ('cross_modal_image_transform' in key):
+                        new_key = key.replace('cross_modal', 'graph_captured_model.cross_modal')
                     if new_key:
                         old_keys.append(key)
                         new_keys.append(new_key)
