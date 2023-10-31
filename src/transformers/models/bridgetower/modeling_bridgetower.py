@@ -1090,19 +1090,9 @@ class BridgeTowerBertCrossLayer_NVTE(nn.Module):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
-        self.mlp = nn.ModuleDict(
-            OrderedDict(
-                [
-                    ("c_fc", te.LayerNormLinear(config.hidden_size, config.hidden_size * 4, config.layer_norm_eps, return_layernorm_output=True)),
-                    ("gelu", self.intermediate_act_fn),
-                    ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size)),
-                ]
-            )
-        )
+        self.mlp = te.LayerNormMLP(config.hidden_size, config.hidden_size * 4, config.layer_norm_eps, return_layernorm_output=True)
         self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
         self.LayerNorm = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        #self.intermediate = BridgeTowerIntermediate(config)
-        #self.output = BridgeTowerOutput(config)
 
     def forward(
         self,
@@ -1155,11 +1145,8 @@ class BridgeTowerBertCrossLayer_NVTE(nn.Module):
             qkv_format="bshd" if cu_seqlens_cross is None else "thd",
         )
         attention_output = cross_attention_outputs[0]
-        intermediate_output, attention_output = self.mlp['c_fc'](cross_attention_outputs[0])
-        intermediate_output = self.mlp['gelu'](intermediate_output)
-        intermediate_output = self.mlp['c_proj'](intermediate_output)
+        intermediate_output, attention_output = self.mlp(cross_attention_outputs[0])
         layer_output = self.LayerNorm(self.output_dropout(intermediate_output) + attention_output)
-        #layer_output = self.output(intermediate_output, attention_output)
         # add cross attentions if we output attention weights
         outputs = outputs + cross_attention_outputs[1:-1]
         outputs = (layer_output,) + outputs

@@ -3484,17 +3484,17 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                         if 'crossattention.output.dense.bias' in key:
                             new_key = key.replace('crossattention.output.dense.bias', 'crossattention.qkv_plus_self_attn.proj.bias')
                         if 'crossattention.output.LayerNorm.weight' in key:
-                            new_key = key.replace('crossattention.output.LayerNorm.weight', 'mlp.c_fc.layer_norm_weight')
+                            new_key = key.replace('crossattention.output.LayerNorm.weight', 'mlp.layer_norm_weight')
                         if 'crossattention.output.LayerNorm.bias' in key:
-                            new_key = key.replace('crossattention.output.LayerNorm.bias', 'mlp.c_fc.layer_norm_bias')
+                            new_key = key.replace('crossattention.output.LayerNorm.bias', 'mlp.layer_norm_bias')
                         if 'intermediate.dense.weight' in key:
-                            new_key = key.replace('intermediate.dense.weight', 'mlp.c_fc.weight')
+                            new_key = key.replace('intermediate.dense.weight', 'mlp.fc1_weight')
                         if 'intermediate.dense.bias' in key:
-                            new_key = key.replace('intermediate.dense.bias', 'mlp.c_fc.bias')
+                            new_key = key.replace('intermediate.dense.bias', 'mlp.fc1_bias')
                         if 'output.dense.weight' in key and 'attention' not in key:
-                            new_key = key.replace('output.dense.weight', 'mlp.c_proj.weight')
+                            new_key = key.replace('output.dense.weight', 'mlp.fc2_weight')
                         if 'output.dense.bias' in key and 'attention' not in key:
-                            new_key = key.replace('output.dense.bias', 'mlp.c_proj.bias')
+                            new_key = key.replace('output.dense.bias', 'mlp.fc2_bias')
                         if 'output.LayerNorm.weight' in key and 'attention' not in key:
                             new_key = key.replace('output.LayerNorm.weight', 'LayerNorm.weight')
                         if 'output.LayerNorm.bias' in key and 'attention' not in key:
