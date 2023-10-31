@@ -3376,20 +3376,24 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                             mha_prefix = 'tf_layer.self_attention'
                             ln2_prefix = 'tf_layer.layernorm_mlp'
                             if 'mlp.c_fc.weight' in key:
-                                new_key = key.replace('mlp.c_fc.weight', 'tf_layer.layernorm_mlp.fc1_weight')
+                                new_key = new_key.replace('mlp.c_fc.weight', 'tf_layer.layernorm_mlp.fc1_weight')
                             if 'mlp.c_fc.bias' in key:
-                                new_key = key.replace('mlp.c_fc.bias', 'tf_layer.layernorm_mlp.fc1_bias')
+                                new_key = new_key.replace('mlp.c_fc.bias', 'tf_layer.layernorm_mlp.fc1_bias')
                             if 'mlp.c_proj.weight' in key:
-                                new_key = key.replace('mlp.c_proj.weight', 'tf_layer.layernorm_mlp.fc2_weight')
+                                new_key = new_key.replace('mlp.c_proj.weight', 'tf_layer.layernorm_mlp.fc2_weight')
                             if 'mlp.c_proj.bias' in key:
-                                new_key = key.replace('mlp.c_proj.bias', 'tf_layer.layernorm_mlp.fc2_bias')
+                                new_key = new_key.replace('mlp.c_proj.bias', 'tf_layer.layernorm_mlp.fc2_bias')
                         else:
                             mha_prefix = 'attn_with_input_layernorm'
-                            ln2_prefix = 'mlp.layernorm_linear'
+                            ln2_prefix = 'mlp.layernorm_mlp'
                             if 'mlp.c_fc.weight' in key:
-                                new_key = new_key.replace('mlp.c_fc.weight', 'mlp.layernorm_linear.weight')
+                                new_key = new_key.replace('mlp.c_fc.weight', 'mlp.layernorm_mlp.fc1_weight')
                             if 'mlp.c_fc.bias' in key:
-                                new_key = new_key.replace('mlp.c_fc.bias', f'mlp.layernorm_linear.bias')
+                                new_key = new_key.replace('mlp.c_fc.bias', f'mlp.layernorm_mlp.fc1_bias')
+                            if 'mlp.c_proj.weight' in key:
+                                new_key = new_key.replace('mlp.c_proj.weight', 'mlp.layernorm_mlp.fc2_weight')
+                            if 'mlp.c_proj.bias' in key:
+                                new_key = new_key.replace('mlp.c_proj.bias', 'mlp.layernorm_mlp.fc2_bias')
                         if 'ln_1.weight' in key:
                             new_key = new_key.replace('ln_1.weight', f'{mha_prefix}.layernorm_qkv.layer_norm_weight')
                         if 'ln_1.bias' in key:

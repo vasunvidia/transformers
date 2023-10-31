@@ -331,13 +331,12 @@ class BridgeTowerResidualAttention_NVTE(nn.Module):
             self.mlp = nn.ModuleDict(
                 OrderedDict(
                     [
-                        ("layernorm_linear", te.LayerNormLinear(
+                        ("layernorm_mlp", te.LayerNormMLP(
                             config.hidden_size,
                             config.hidden_size * 4,
-                            eps=config.layer_norm_eps
+                            eps=config.layer_norm_eps,
+                            activation='qgelu'
                             )),
-                        ("gelu", QuickGELUActivation()),
-                        ("c_proj", te.Linear(config.hidden_size * 4, config.hidden_size))
                     ]
                 )
             )
@@ -1650,8 +1649,8 @@ class BridgeTowerPreTrainedModel(PreTrainedModel):
                         # MultiheadAttention + LayerNormLinear in BridgeTowerResidualAttention_NVTE
                         nn.init.normal_(block.attn_with_input_layernorm.layernorm_qkv.weight, std=attn_std * self.config.initializer_factor)
                         nn.init.normal_(block.attn_with_input_layernorm.proj.weight, std=proj_std * self.config.initializer_factor)
-                        nn.init.normal_(block.mlp.layernorm_linear.weight, std=fc_std * self.config.initializer_factor)
-                        nn.init.normal_(block.mlp.c_proj.weight, std=proj_std * self.config.initializer_factor)
+                        nn.init.normal_(block.mlp.layernorm_mlp.fc1_weight, std=fc_std * self.config.initializer_factor)
+                        nn.init.normal_(block.mlp.layernorm_mlp.fc2_weight, std=proj_std * self.config.initializer_factor)
 
             nn.init.normal_(module.visual.embeddings.class_embedding, std=attn_std * self.config.initializer_factor)
             nn.init.normal_(
