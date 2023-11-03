@@ -1774,11 +1774,21 @@ class Trainer:
             image_tokens = self._train_batch_size * image_seq_len
             padded_image_tokens = image_tokens + 256 - ((image_tokens-1) % 256) - 1
             hidden_size = self.model.config.hidden_size
+            image_embeds = torch.nn.functional.pad(image_embeds.view(-1, hidden_size), (0, 0, 0, padded_image_tokens-image_tokens)).detach()
+            image_embeds.requires_grad_()
+
+            cu_seqlens_image = torch.arange((2*self._train_batch_size)+1, dtype=torch.int32,
+                        device=args.device) * image_seq_len
+            npad = padded_image_tokens - image_tokens
+            cu_seqlens_image[self._train_batch_size+1:] = cu_seqlens_image[self._train_batch_size] + torch.arange(1, self._train_batch_size+1, dtype=torch.int32,
+                        device=args.device)
+            cu_seqlens_image[-1] = cu_seqlens_image[self._train_batch_size] + npad
+            cu_seqlens_image.requires_grad_(requires_grad=False)
             sample_input_encoder = [
-                torch.ones(avg_seq_len*self._train_batch_size, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=True), #text_embeds
+                torch.zeros(avg_seq_len*self._train_batch_size, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=True), #text_embeds
                 torch.ones((2*self._train_batch_size)+1, dtype=torch.int32, device=args.device, requires_grad=False),                      #cu_seqlens_text
-                torch.ones(padded_image_tokens, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=True),                #image_embeds
-                torch.ones((2*self._train_batch_size)+1, dtype=torch.int32, device=args.device, requires_grad=False),                      #cu_seqlens_image
+                image_embeds,
+                cu_seqlens_image,
                 torch.ones(1, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=False),                                 #text_token_type_embeddings
                 torch.ones(1, hidden_size, dtype=torch.bfloat16, device=args.device, requires_grad=False),                                 #image_token_type_embeddings
                 torch.ones(self._train_batch_size, image_seq_len, dtype=torch.int64, device=args.device, requires_grad=False),             #pixel_mask

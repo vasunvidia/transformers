@@ -481,11 +481,12 @@ class BridgeTowerVisionTransformer(nn.Module):
             return hidden_states, None, hidden_states.size(0)
         else:
             bs, seq_len = hidden_states.size(0), hidden_states.size(1)
+            image_tokens = bs * seq_len
             if USE_PAD:
                 extra_batch = bs
                 cu_seqlens = torch.arange(hidden_states.size(0)+extra_batch+1, dtype=torch.int32,
                         device=hidden_states.device) * seq_len
-                npad = 240
+                npad = 256 - ((image_tokens-1) % 256) - 1
                 if extra_batch > 0:
                     cu_seqlens[bs+1:] = cu_seqlens[bs] + torch.arange(1, extra_batch+1, dtype=torch.int32,
                         device=hidden_states.device)
@@ -2141,10 +2142,10 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        all_hidden_states_text = () if output_hidden_states else None
-        all_hidden_states_image = () if output_hidden_states else None
-        all_hidden_states_cross = () if output_hidden_states else None
-        all_hidden_states = () if output_hidden_states else None
+        all_hidden_states_text = ()
+        all_hidden_states_image = ()
+        all_hidden_states_cross = ()
+        all_hidden_states = ()
         all_self_attentions = () if output_attentions else None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -2207,9 +2208,14 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
                 all_hidden_states_image += (image_embeds_out[:npad,:].view(bs, seq_len_image, -1),)
             for i, hidden_states_cross_out in enumerate(partial_hidden_states_cross):
                 all_hidden_states_cross += ((self.graph_captured_model.text_model.encoder.forward_post(hidden_states_cross_out[0][:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), hidden_states_cross_out[1][:npad,:].view(bs, seq_len_image, -1)),)
+        else:
+            text_embeds_out = partial_hidden_states_text[-1]
+            all_hidden_states_text += (self.graph_captured_model.text_model.encoder.forward_post(text_embeds_out[:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text),)
+            image_embeds_out = partial_hidden_states_image[-1]
+            all_hidden_states_image += (image_embeds_out[:npad,:].view(bs, seq_len_image, -1),)
+            hidden_states_cross_out = partial_hidden_states_cross[-1]
+            all_hidden_states_cross += ((self.graph_captured_model.text_model.encoder.forward_post(hidden_states_cross_out[0][:npad_text,:], indices=indices, bs=bs, seq_len=seq_len_text), hidden_states_cross_out[1][:npad,:].view(bs, seq_len_image, -1)),)
 
-            if output_attentions:
-                all_self_attentions += ((layer_outputs_text[1], layer_outputs_image[1]),)
         if USE_PAD:
             image_embeds = image_embeds[:npad,:]
             cross_image_features = cross_image_features[:npad,:]
@@ -2228,8 +2234,7 @@ class BridgeTowerModel(BridgeTowerPreTrainedModel):
         text_features, image_features = cross_text_features, cross_image_features
         cls_features = self.get_cls_features(text_features, image_features)
 
-        if output_hidden_states:
-            all_hidden_states = (all_hidden_states_text, all_hidden_states_image, all_hidden_states_cross)
+        all_hidden_states = (all_hidden_states_text, all_hidden_states_image, all_hidden_states_cross)
 
         if not return_dict:
             return tuple(
