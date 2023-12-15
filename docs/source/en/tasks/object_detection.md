@@ -136,8 +136,8 @@ To get an even better understanding of the data, visualize an example in the dat
 >>> label2id = {v: k for k, v in id2label.items()}
 
 >>> for i in range(len(annotations["id"])):
-...     box = annotations["bbox"][i - 1]
-...     class_idx = annotations["category"][i - 1]
+...     box = annotations["bbox"][i]
+...     class_idx = annotations["category"][i]
 ...     x, y, w, h = tuple(box)
 ...     draw.rectangle((x, y, x + w, y + h), outline="red", width=1)
 ...     draw.text((x, y), id2label[class_idx], fill="white")
@@ -512,7 +512,7 @@ Finally, load the metrics and run the evaluation.
 ...         outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
 
 ...         orig_target_sizes = torch.stack([target["orig_size"] for target in labels], dim=0)
-...         results = im_processor.post_process(outputs, orig_target_sizes)  # convert outputs of model to COCO api
+...         results = im_processor.post_process(outputs, orig_target_sizes)  # convert outputs of model to Pascal VOC format (xmin, ymin, xmax, ymax)
 
 ...         module.add(prediction=results, reference=labels)
 ...         del batch
